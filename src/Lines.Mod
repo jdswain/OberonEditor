@@ -128,4 +128,73 @@ MODULE Lines;
     col  := pos - L.starts[line]
   END Locate;
 
+  (* ---------------- incremental update ---------------- *)
+
+  (* Splice value v into the sorted starts[] at the right position. *)
+  PROCEDURE insertEntry(L: Lines; v: INTEGER);
+    VAR i, j: INTEGER;
+  BEGIN
+    IF L.count < MaxLines THEN
+      i := 0;
+      WHILE (i < L.count) & (L.starts[i] < v) DO INC(i) END;
+      j := L.count;
+      WHILE j > i DO L.starts[j] := L.starts[j-1]; DEC(j) END;
+      L.starts[i] := v;
+      INC(L.count)
+    END
+  END insertEntry;
+
+  PROCEDURE Inserted*(L: Lines; pos, count: INTEGER);
+  (* Apply an insertion of `count` bytes at `pos`. Editor calls this
+     after Buffer.Insert. Lines reads the inserted span from the buffer
+     to find newlines.  No-op when the table is stale (a later rebuild
+     will pick up the latest state). *)
+    VAR r: Buffer.Reader; ch: CHAR; p, i: INTEGER;
+  BEGIN
+    IF ~L.stale & (count > 0) THEN
+      (* Shift line starts strictly past `pos` rightward by count. *)
+      i := 0;
+      WHILE (i < L.count) & (L.starts[i] <= pos) DO INC(i) END;
+      WHILE i < L.count DO
+        L.starts[i] := L.starts[i] + count; INC(i)
+      END;
+      (* Scan the inserted span for newlines, inserting an entry for
+         each line-after-newline at its post-shift position. *)
+      Buffer.OpenReader(r, L.buf, pos);
+      p := 0;
+      Buffer.Read(r, ch);
+      WHILE (p < count) & ~r.eot DO
+        IF ch = Newline THEN insertEntry(L, pos + p + 1) END;
+        INC(p);
+        Buffer.Read(r, ch)
+      END
+    END
+  END Inserted;
+
+  PROCEDURE Deleted*(L: Lines; beg, end: INTEGER);
+  (* Apply a deletion of [beg, end). Editor calls this after
+     Buffer.Delete. Lines drops entries whose start is in (beg, end]
+     (their triggering newline is gone) and shifts remaining
+     `> end` entries leftward by (end - beg). *)
+    VAR i, j, k, n, removed, delta: INTEGER;
+  BEGIN
+    IF ~L.stale & (end > beg) THEN
+      n := L.count;
+      delta := end - beg;
+      (* i = first entry with start > beg, j = first entry with start > end. *)
+      i := 0;
+      WHILE (i < n) & (L.starts[i] <= beg) DO INC(i) END;
+      j := i;
+      WHILE (j < n) & (L.starts[j] <= end) DO INC(j) END;
+      removed := j - i;
+      (* Compact: shift entries [j, n) to [i, n - removed), each minus delta. *)
+      k := j;
+      WHILE k < n DO
+        L.starts[k - removed] := L.starts[k] - delta;
+        INC(k)
+      END;
+      L.count := n - removed
+    END
+  END Deleted;
+
 END Lines.

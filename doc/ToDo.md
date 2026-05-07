@@ -14,7 +14,7 @@ Marking convention: `x` done, `/` in progress, blank or `-` open.
 
 ## Lines
 
-- Incremental update on edit. `Lines.Invalidate` triggers a full rebuild on next query; for a 64 KB buffer that's ~64 K Reads per keystroke. Imperceptible at host speeds, noticeable on 65C816. Real fix: apply `Insert(pos, n)` / `Delete(beg, end)` deltas to `starts[]` directly so the table stays valid.
+x Incremental update on edit. `Lines.Inserted(pos, count)` and `Lines.Deleted(beg, end)` now apply the delta to `starts[]` directly; full rebuild only happens on `Lines.Invalidate` (used by `Buffer.Load`). Equivalence with rebuild verified by 10 unit tests. Measured ~0.2 ms per keystroke roundtrip on a 1000-line buffer.
 - `MaxLines = 8192` cap. Past that, `LineStart` for indices ≥ `MaxLines` is inaccurate. Documented; revisit if real files trip it.
 
 ## Editor (Oed)

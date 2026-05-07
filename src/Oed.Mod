@@ -96,15 +96,17 @@ MODULE Oed;
 
   PROCEDURE InsertCh(ch: CHAR);
   BEGIN
-    Buffer.Insert(buf, cur, ch); INC(cur);
-    Lines.Invalidate(lines)
+    Buffer.Insert(buf, cur, ch);
+    Lines.Inserted(lines, cur, 1);
+    INC(cur)
   END InsertCh;
 
   PROCEDURE BackspaceCh;
   BEGIN
     IF cur > 0 THEN
-      Buffer.Delete(buf, cur - 1, cur); DEC(cur);
-      Lines.Invalidate(lines)
+      Buffer.Delete(buf, cur - 1, cur);
+      Lines.Deleted(lines, cur - 1, cur);
+      DEC(cur)
     END
   END BackspaceCh;
 
@@ -112,7 +114,7 @@ MODULE Oed;
   BEGIN
     IF cur < buf.len THEN
       Buffer.Delete(buf, cur, cur + 1);
-      Lines.Invalidate(lines)
+      Lines.Deleted(lines, cur, cur + 1)
     END
   END DeleteCh;
 
@@ -198,7 +200,7 @@ MODULE Oed;
     END;
     cur := cur + n;
     yankLen := n;
-    Lines.Invalidate(lines)
+    Lines.Inserted(lines, yankStart, n)
   END insertSlot;
 
   PROCEDURE CopyRegion;
@@ -220,7 +222,7 @@ MODULE Oed;
       Buffer.Delete(buf, lo, hi);
       cur := lo;
       mark := -1;
-      Lines.Invalidate(lines);
+      Lines.Deleted(lines, lo, hi);
       SetStatus("Region killed")
     ELSE
       SetStatus("No mark set")
@@ -245,7 +247,7 @@ MODULE Oed;
       ELSE pushKill(cur, killTo)
       END;
       Buffer.Delete(buf, cur, killTo);
-      Lines.Invalidate(lines);
+      Lines.Deleted(lines, cur, killTo);
       lastWasKill := TRUE;
       SetStatus("Line killed")
     ELSE
@@ -277,6 +279,7 @@ MODULE Oed;
       lastWasYank := FALSE
     ELSE
       Buffer.Delete(buf, yankStart, yankStart + yankLen);
+      Lines.Deleted(lines, yankStart, yankStart + yankLen);
       cur := yankStart;
       yankIndex := (yankIndex + 1) MOD killCount;
       insertSlot(ringSlot(yankIndex));

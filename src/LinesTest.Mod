@@ -140,6 +140,97 @@ MODULE LinesTest;
     Expect(TRUE, "no assertion — caller responsibility documented")
   END TestStaleWithoutInvalidate;
 
+  (* Capture the table state via the public API and compare with what
+     a forced rebuild would produce. Verifies incremental updates have
+     not drifted from the rebuild's truth. *)
+  PROCEDURE assertSameAsRebuild(b: Buffer.Buffer; L: Lines.Lines;
+                                VAR name: ARRAY OF CHAR);
+    CONST MaxCmp = 64;
+    VAR cnt1, cnt2, i: INTEGER;
+        starts1: ARRAY MaxCmp OF INTEGER;
+        ok: BOOLEAN;
+  BEGIN
+    cnt1 := Lines.Count(L);
+    i := 0;
+    WHILE (i < cnt1) & (i < MaxCmp) DO
+      starts1[i] := Lines.LineStart(L, i); INC(i)
+    END;
+    Lines.Invalidate(L);
+    cnt2 := Lines.Count(L);
+    ok := cnt1 = cnt2;
+    i := 0;
+    WHILE ok & (i < cnt1) & (i < MaxCmp) DO
+      ok := starts1[i] = Lines.LineStart(L, i); INC(i)
+    END;
+    Expect(ok, name)
+  END assertSameAsRebuild;
+
+  PROCEDURE TestIncrementalInsert;
+    VAR b: Buffer.Buffer; L: Lines.Lines; dummy: INTEGER;
+  BEGIN
+    Out.WriteString("Inserted (incremental):"); Out.Ln;
+    b := Buffer.New();
+    L := Lines.New(b);
+    dummy := Lines.Count(L);                       (* prime: not stale *)
+    Buffer.Insert(b, 0, "a");          Lines.Inserted(L, 0, 1);
+    assertSameAsRebuild(b, L, "after 'a'");
+    Buffer.Insert(b, 1, 0AX);          Lines.Inserted(L, 1, 1);
+    assertSameAsRebuild(b, L, "after newline at end");
+    Buffer.Insert(b, 2, "b");          Lines.Inserted(L, 2, 1);
+    assertSameAsRebuild(b, L, "after 'b' on line 2");
+    Buffer.Insert(b, 0, "Z");          Lines.Inserted(L, 0, 1);
+    assertSameAsRebuild(b, L, "after 'Z' at start (shifts line 1)");
+    Buffer.Insert(b, 2, 0AX);          Lines.Inserted(L, 2, 1);
+    assertSameAsRebuild(b, L, "after splitting line 0 with newline")
+  END TestIncrementalInsert;
+
+  PROCEDURE TestIncrementalDelete;
+  (* Each scenario builds the buffer fresh via InsertStr+Insert, primes
+     the line table, applies a delete + Lines.Deleted, then compares
+     against a forced rebuild. *)
+    VAR b: Buffer.Buffer; L: Lines.Lines; dummy: INTEGER;
+  BEGIN
+    Out.WriteString("Deleted (incremental):"); Out.Ln;
+
+    b := Buffer.New();
+    Buffer.InsertStr(b, 0, "abc"); Buffer.Insert(b, 3, 0AX);
+    Buffer.InsertStr(b, 4, "def"); Buffer.Insert(b, 7, 0AX);
+    Buffer.InsertStr(b, 8, "ghi");
+    L := Lines.New(b); dummy := Lines.Count(L);
+    Buffer.Delete(b, 1, 2);  Lines.Deleted(L, 1, 2);
+    assertSameAsRebuild(b, L, "delete one char on line 0");
+
+    b := Buffer.New();
+    Buffer.InsertStr(b, 0, "abc"); Buffer.Insert(b, 3, 0AX);
+    Buffer.InsertStr(b, 4, "def");
+    L := Lines.New(b); dummy := Lines.Count(L);
+    Buffer.Delete(b, 3, 4);  Lines.Deleted(L, 3, 4);
+    assertSameAsRebuild(b, L, "delete the newline (lines merge)");
+
+    b := Buffer.New();
+    Buffer.InsertStr(b, 0, "abc"); Buffer.Insert(b, 3, 0AX);
+    Buffer.InsertStr(b, 4, "def"); Buffer.Insert(b, 7, 0AX);
+    Buffer.InsertStr(b, 8, "ghi");
+    L := Lines.New(b); dummy := Lines.Count(L);
+    Buffer.Delete(b, 0, 4);  Lines.Deleted(L, 0, 4);
+    assertSameAsRebuild(b, L, "delete entire first line incl newline");
+
+    b := Buffer.New();
+    Buffer.InsertStr(b, 0, "abc"); Buffer.Insert(b, 3, 0AX);
+    Buffer.InsertStr(b, 4, "def"); Buffer.Insert(b, 7, 0AX);
+    Buffer.InsertStr(b, 8, "ghi");
+    L := Lines.New(b); dummy := Lines.Count(L);
+    Buffer.Delete(b, 2, 9);  Lines.Deleted(L, 2, 9);
+    assertSameAsRebuild(b, L, "delete spanning two newlines");
+
+    b := Buffer.New();
+    Buffer.InsertStr(b, 0, "abc"); Buffer.Insert(b, 3, 0AX);
+    Buffer.InsertStr(b, 4, "def");
+    L := Lines.New(b); dummy := Lines.Count(L);
+    Buffer.Delete(b, 0, 7);  Lines.Deleted(L, 0, 7);
+    assertSameAsRebuild(b, L, "delete the entire buffer")
+  END TestIncrementalDelete;
+
   PROCEDURE Run*;
   BEGIN
     pass := 0; fail := 0;
@@ -150,6 +241,8 @@ MODULE LinesTest;
     TestRunOfNewlines;
     TestInvalidate;
     TestStaleWithoutInvalidate;
+    TestIncrementalInsert;
+    TestIncrementalDelete;
     Out.Ln;
     Out.WriteString("results: ");
     Out.WriteInt(pass);
