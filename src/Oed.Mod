@@ -10,7 +10,7 @@ MODULE Oed;
    arrives, since wrap turns "screen row" and "buffer line" into
    different concepts. *)
 
-  IMPORT TUI, Buffer, Lines, Env, Mini;
+  IMPORT TUI, Buffer, Lines, Env, Mini, Files;
 
   CONST
     ModeEntry   = 0;
@@ -54,6 +54,39 @@ MODULE Oed;
     END;
     dst[i] := 0X
   END CopyStr;
+
+  PROCEDURE AppendStr(VAR dst: ARRAY OF CHAR; src: ARRAY OF CHAR);
+    VAR i, j: INTEGER;
+  BEGIN
+    i := 0;
+    WHILE (i < LEN(dst) - 1) & (dst[i] # 0X) DO INC(i) END;
+    j := 0;
+    WHILE (i < LEN(dst) - 1) & (j < LEN(src)) & (src[j] # 0X) DO
+      dst[i] := src[j]; INC(i); INC(j)
+    END;
+    dst[i] := 0X
+  END AppendStr;
+
+  (* Copy the directory portion of path into dir, including the
+     trailing slash. dir = "" when path has no slash (cwd). *)
+  PROCEDURE DirOf(path: ARRAY OF CHAR; VAR dir: ARRAY OF CHAR);
+    VAR i, last: INTEGER;
+  BEGIN
+    last := -1; i := 0;
+    WHILE (i < LEN(path)) & (path[i] # 0X) DO
+      IF path[i] = "/" THEN last := i END;
+      INC(i)
+    END;
+    IF last < 0 THEN
+      dir[0] := 0X
+    ELSE
+      i := 0;
+      WHILE (i <= last) & (i < LEN(dir) - 1) DO
+        dir[i] := path[i]; INC(i)
+      END;
+      dir[i] := 0X
+    END
+  END DirOf;
 
   PROCEDURE SetStatus(s: ARRAY OF CHAR);
   BEGIN CopyStr(status, s)
@@ -446,12 +479,44 @@ MODULE Oed;
 
   (* ---------------- file commands ---------------- *)
 
-  PROCEDURE DoSave;
+  (* Save without any checks. Used after the directory pre-flight
+     in DoSave has confirmed the target dir exists (or just created
+     it on the user's behalf). *)
+  PROCEDURE writeFile;
     VAR res: INTEGER;
   BEGIN
     Buffer.Save(buf, name, res);
     IF res = Buffer.Ok THEN SetStatus("Saved")
     ELSE SetStatus("Save failed")
+    END
+  END writeFile;
+
+  (* Pre-flight check: if the target directory of `name` doesn't
+     exist, offer to create it. Otherwise the underlying
+     Files.Register would fail and Buffer.Save now leaves
+     b.changed = TRUE so the user gets the discard prompt on quit. *)
+  PROCEDURE DoSave;
+    VAR dir: ARRAY NameLen OF CHAR;
+        msg: ARRAY 192 OF CHAR;
+        res: INTEGER;
+  BEGIN
+    DirOf(name, dir);
+    IF (dir[0] # 0X) & (Files.Exists(dir) = 0) THEN
+      CopyStr(msg, "Directory '");
+      AppendStr(msg, dir);
+      AppendStr(msg, "' does not exist. Create? (y/n) ");
+      IF Mini.Confirm(msg) THEN
+        Files.MakeDir(dir, res);
+        IF res = 0 THEN
+          writeFile
+        ELSE
+          SetStatus("Could not create directory")
+        END
+      ELSE
+        SetStatus("Save cancelled — directory missing")
+      END
+    ELSE
+      writeFile
     END
   END DoSave;
 

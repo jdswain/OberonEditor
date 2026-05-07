@@ -241,8 +241,18 @@ MODULE Buffer;
         p := p.next
       END;
       Files.Register(f);
-      b.changed := FALSE;
-      res := Ok
+      (* Files.Register doesn't surface a status code; it can fail
+         silently (rename into a missing directory, permission denied,
+         disk full). Probe the filesystem to confirm the file
+         actually appeared before clearing the dirty flag. Without
+         this check a failed save would clear b.changed and the user
+         could quit unprompted. *)
+      IF Files.Exists(name) > 0 THEN
+        b.changed := FALSE;
+        res := Ok
+      ELSE
+        res := IOError
+      END
     END
   END Save;
 
