@@ -2,9 +2,6 @@
 
 Marking convention: `x` done, `/` in progress, blank or `-` open.
 
-## Key bindings
-Add C-y
-
 ## Buffer / storage
 
 - File size cap: `Buffer.Load` returns `IOError` for files larger than `RegionCap` (64 KB). Two routes:
@@ -54,10 +51,10 @@ Add C-y
 - **PTY scripted input gotcha** worth remembering: `\x1b[B` byte-by-byte ≠ Down arrow. The TUI escape-sequence decoder times out at 100 ms; in tests, send each escape sequence as one `os.write` call.
 - **No tests for Mini.Mod or for the editor's interactive paths.** The TUI dependency makes it expensive to fixture; we rely on PTY smoke tests in conversation. A small "headless TUI" backend (writing into an in-memory framebuffer) would let us script tests properly.
 
-## Performance backlog (not currently bottlenecking)
+## Performance backlog
 
-- `PosToColRow` removed in favour of `Lines.Locate` — done.
-- Status-bar and scroll calls now O(log lines) instead of O(buffer.len) — done.
+x `PosToColRow` removed in favour of `Lines.Locate`.
+x Status-bar and scroll calls now O(log lines) instead of O(buffer.len).
 - Refresh paints the entire viewport every frame. For 65C816, region-dirty tracking would matter; for host PTY it's invisible.
 
 ## Feature ideas

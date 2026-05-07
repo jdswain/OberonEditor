@@ -41,6 +41,7 @@ MODULE Oed;
     yankStart:   INTEGER;      (* buffer pos where current yank text starts *)
     yankLen:     INTEGER;      (* length of current yank text *)
     lastWasYank: BOOLEAN;      (* was the previous command Yank or YankPop? *)
+    lastWasKill: BOOLEAN;      (* successive C-k append to the same ring entry *)
 
   (* ---------------- string helpers ---------------- *)
 
@@ -122,6 +123,29 @@ MODULE Oed;
     IF killCount < KillRingSize THEN INC(killCount) END
   END pushKill;
 
+  (* Append [lo, hi) onto the current head entry instead of pushing
+     a new one. Used by successive C-k so a multi-line kill ends up in
+     a single ring slot. *)
+  PROCEDURE appendKill(lo, hi: INTEGER);
+    VAR r: Buffer.Reader; ch: CHAR; n, room: INTEGER;
+  BEGIN
+    IF killCount = 0 THEN
+      pushKill(lo, hi)
+    ELSE
+      n := killLens[killHead];
+      room := KillCap - n;
+      IF hi - lo > room THEN hi := lo + room END;
+      Buffer.OpenReader(r, buf, lo);
+      Buffer.Read(r, ch);
+      WHILE ~r.eot & (lo < hi) DO
+        killRing[killHead][n] := ch; INC(n);
+        INC(lo);
+        Buffer.Read(r, ch)
+      END;
+      killLens[killHead] := n
+    END
+  END appendKill;
+
   (* Index of the entry yankIndex steps older than killHead. *)
   PROCEDURE ringSlot(yi: INTEGER): INTEGER;
   BEGIN
@@ -169,6 +193,32 @@ MODULE Oed;
       SetStatus("No mark set")
     END
   END KillRegion;
+
+  (* Kill from cursor to end of line. If already at end of line, kill
+     the newline itself (joining with the next line). Successive C-k
+     presses append to the head ring entry; any other command in
+     between resets the chain. *)
+  PROCEDURE KillLine;
+    VAR line, col, lineEnd, killTo: INTEGER;
+  BEGIN
+    Lines.Locate(lines, cur, line, col);
+    lineEnd := Lines.LineEnd(lines, line);
+    IF cur < lineEnd THEN killTo := lineEnd
+    ELSIF cur < buf.len THEN killTo := cur + 1
+    ELSE killTo := cur
+    END;
+    IF killTo > cur THEN
+      IF lastWasKill THEN appendKill(cur, killTo)
+      ELSE pushKill(cur, killTo)
+      END;
+      Buffer.Delete(buf, cur, killTo);
+      Lines.Invalidate(lines);
+      lastWasKill := TRUE;
+      SetStatus("Line killed")
+    ELSE
+      SetStatus("End of buffer")
+    END
+  END KillLine;
 
   PROCEDURE Yank;
   BEGIN
@@ -644,9 +694,10 @@ MODULE Oed;
   (* ---------------- input ---------------- *)
 
   PROCEDURE EntryKey(k: INTEGER);
-    VAR ch: CHAR; isYankCmd: BOOLEAN;
+    VAR ch: CHAR; isYankCmd, isKillCmd: BOOLEAN;
   BEGIN
     isYankCmd := (k = TUI.KeyCtrlY) OR (k = TUI.KeyMetaY);
+    isKillCmd := k = TUI.KeyCtrlK;
     CASE k OF
       TUI.KeyCtrlX:
         mode := ModeCommand;
@@ -685,6 +736,7 @@ MODULE Oed;
     | TUI.KeyCtrlY:      Yank
     | TUI.KeyMetaW:      CopyRegion
     | TUI.KeyMetaY:      YankPop
+    | TUI.KeyCtrlK:      KillLine
     ELSE
       IF (k >= 32) & (k < 127) THEN
         ch := CHR(k);
@@ -694,7 +746,8 @@ MODULE Oed;
         SetStatus("(unhandled key)")
       END
     END;
-    IF ~isYankCmd THEN lastWasYank := FALSE END
+    IF ~isYankCmd THEN lastWasYank := FALSE END;
+    IF ~isKillCmd THEN lastWasKill := FALSE END
   END EntryKey;
 
   PROCEDURE CommandKey(k: INTEGER);
@@ -763,6 +816,7 @@ MODULE Oed;
     yankStart   := 0;
     yankLen     := 0;
     lastWasYank := FALSE;
+    lastWasKill := FALSE;
     mode        := ModeEntry;
     running := TRUE;
     SetStatus("HELP: Ctrl-X then Ctrl-S save, Ctrl-W save-as, Ctrl-F open, Ctrl-C quit");

@@ -104,6 +104,7 @@ the key on most terminals).
 | `C-Space` | set mark |
 | `C-w` | kill region (mark↔point) into kill ring |
 | `M-w` | copy region into kill ring |
+| `C-k` | kill from point to end of line (or the newline if already at EOL); successive `C-k` append to the same ring entry |
 | `C-y` | yank most recent kill |
 | `M-y` | yank-pop (after `C-y` or `M-y`): replace with next-older entry |
 
