@@ -1,0 +1,23 @@
+# Build outputs
+bin/
+
+# Compiler intermediates emitted alongside .Mod sources
+*.o
+*.ll
+*.smb
+*.deps
+
+# Test artifacts (BufferTest writes save/load round-trip files)
+*.tmp
+
+# Editor's default Save target when no filename is set
+untitled.txt
+
+# Editor / OS noise
+*~
+.DS_Store
+
+# Local agent / IDE state
+.claude/
+.vscode/
+.idea/
