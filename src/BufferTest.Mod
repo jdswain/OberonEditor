@@ -230,6 +230,37 @@ MODULE BufferTest;
     Expect(StrEq(buf, ""), "content empty")
   END TestSaveEmpty;
 
+  (* Verify the chunk-list storage works across multiple chunks.
+     Insert > ChunkSize (4096) bytes, walk them back via Reader,
+     check every byte matches what was written. *)
+  PROCEDURE TestLargeInsert;
+    CONST N = 10000;
+    VAR b: Buffer.Buffer; r: Buffer.Reader; ch, expected: CHAR;
+        i, ord: INTEGER; ok: BOOLEAN;
+  BEGIN
+    Out.WriteString("large insert spans chunks:"); Out.Ln;
+    b := Buffer.New();
+    i := 0;
+    WHILE i < N DO
+      ord := ORD("A") + i MOD 26;
+      expected := CHR(ord);
+      Buffer.Insert(b, i, expected);
+      INC(i)
+    END;
+    Expect(b.len = N, "length = 10000");
+    Expect(Buffer.PieceCount(b) = 1, "one piece (coalesced across chunks)");
+    Buffer.OpenReader(r, b, 0);
+    i := 0; ok := TRUE;
+    Buffer.Read(r, ch);
+    WHILE ~r.eot & ok & (i < N) DO
+      ord := ORD("A") + i MOD 26;
+      ok := ch = CHR(ord);
+      INC(i);
+      Buffer.Read(r, ch)
+    END;
+    Expect(ok & (i = N), "every byte read back correctly")
+  END TestLargeInsert;
+
   PROCEDURE TestFind;
     VAR b: Buffer.Buffer; pat: ARRAY 16 OF CHAR;
         pos: INTEGER; ok: BOOLEAN;
@@ -272,6 +303,7 @@ MODULE BufferTest;
     TestSaveLoadRoundtrip;
     TestLoadMissing;
     TestSaveEmpty;
+    TestLargeInsert;
     TestFind;
     Out.Ln;
     Out.WriteString("results: ");

@@ -4,13 +4,12 @@ Marking convention: `x` done, `/` in progress, blank or `-` open.
 
 ## Buffer / storage
 
-- File size cap: `Buffer.Load` returns `IOError` for files larger than `RegionCap` (64 KB). Two routes:
-  - bump `RegionCap` (memory cost: every buffer pre-allocates the full region)
-  - replace `Region` with a chunk list of fixed-size blocks (~30 lines, all in `getByte`/`appendByte`)
+x File size cap. `Region` is now a chunk list of 4 KB blocks, allocated on demand. Empty buffer holds zero data chunks; grows by one `NEW(Chunk)` per 4 KB of content. Cap is `MaxChunks * ChunkSize = 1 MB` per region (2 MB per buffer). No realloc-and-copy on grow.
 - Extract storage to `Storage.Mod`. Current internal helpers `getByte` / `appendByte` plus `src: INTEGER` tag are sized for this lift; concrete backends (`MemStorage`, `FileStorage`, `ChunkedStorage`) extend `StorageDesc` and Piece's `src` becomes `Storage.Storage`. Public Buffer API stays unchanged.
 - `Buffer.InsertBytes(b, pos, bytes, n)` batch primitive. Yank inserts char-by-char, each going through `FindPiece` + `SplitPiece`. Caches make this fast in practice but it's O(n·log) instead of O(n).
 - Backup-on-save. Wirth's `Edit.Mod` renames the existing file to `.Bak` before writing; we don't.
 - Cut/paste piece chain (Wirth-style `Texts.Buffer`). Originally deferred at design time; the kill ring at the editor level covers our current use case, but a piece-level `Clip` type would be a cleaner fit if we ever need region-typed cut/paste with richer than ASCII content.
+- Bump `MaxChunks` to grow the per-region cap past 1 MB. For very large files we'd want a sparse chunk index (current is a flat array of 256 pointers per region = 2 KB overhead; bumping to e.g. 4096 chunks for 16 MB doubles the overhead).
 
 ## Lines
 

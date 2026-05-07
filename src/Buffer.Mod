@@ -27,7 +27,13 @@ MODULE Buffer;
     NotFound* = 1;
     IOError*  = 2;
 
-    RegionCap = 65536;        (* fixed cap per region for v1 *)
+    (* Each region is a list of fixed-size chunks. Chunks are allocated
+       on demand: an empty buffer holds zero data chunks, a region grows
+       by one ChunkSize-byte allocation per ChunkSize bytes consumed.
+       No realloc-and-copy on grow. *)
+    ChunkSize = 4096;
+    MaxChunks = 256;
+    RegionCap = 1048576;          (* ChunkSize * MaxChunks = 1 MB per region *)
 
     Orig   = 0;               (* Piece.src tags *)
     Append = 1;
@@ -35,10 +41,16 @@ MODULE Buffer;
   TYPE
     Buffer* = POINTER TO BufferDesc;
 
+    Chunk = POINTER TO ChunkDesc;
+    ChunkDesc = RECORD
+      bytes: ARRAY ChunkSize OF CHAR
+    END;
+
     Region = POINTER TO RegionDesc;
     RegionDesc = RECORD
-      len:   INTEGER;
-      bytes: ARRAY RegionCap OF CHAR
+      len:    INTEGER;                    (* bytes used *)
+      nch:    INTEGER;                    (* chunks allocated *)
+      chunks: ARRAY MaxChunks OF Chunk
     END;
 
     (* Piece is exported as a type name only — no fields are exported.
@@ -80,14 +92,19 @@ MODULE Buffer;
     VAR r: Region;
   BEGIN
     IF src = Orig THEN r := b.orig ELSE r := b.append END;
-    RETURN r.bytes[off]
+    RETURN r.chunks[off DIV ChunkSize].bytes[off MOD ChunkSize]
   END getByte;
 
   PROCEDURE appendByte(b: Buffer; ch: CHAR): INTEGER;
-    VAR off: INTEGER;
+    VAR off, ci, bi: INTEGER;
   BEGIN
     off := b.append.len;
-    b.append.bytes[off] := ch;
+    ci  := off DIV ChunkSize;
+    bi  := off MOD ChunkSize;
+    IF ci >= b.append.nch THEN
+      NEW(b.append.chunks[b.append.nch]); INC(b.append.nch)
+    END;
+    b.append.chunks[ci].bytes[bi] := ch;
     INC(b.append.len);
     RETURN off
   END appendByte;
@@ -149,9 +166,12 @@ MODULE Buffer;
      Setting b.first first lets ARC cascade through the now-orphaned
      pieces; b.cache must follow so it doesn't pin a freed piece. *)
   PROCEDURE reset(b: Buffer);
+  (* Allocate fresh, zero-chunk Regions. The previous regions become
+     unreachable and ARC reclaims them, releasing every chunk in the
+     process. Cheaper than walking and NIL-ing the chunk array. *)
   BEGIN
-    b.orig.len   := 0;
-    b.append.len := 0;
+    NEW(b.orig);   b.orig.len := 0;   b.orig.nch := 0;
+    NEW(b.append); b.append.len := 0; b.append.nch := 0;
     b.first      := b.trailer;
     b.cache      := b.trailer;
     b.cacheOrg   := 0;
@@ -166,8 +186,8 @@ MODULE Buffer;
     VAR b: Buffer; t: Piece;
   BEGIN
     NEW(b);
-    NEW(b.orig);   b.orig.len := 0;
-    NEW(b.append); b.append.len := 0;
+    NEW(b.orig);   b.orig.len := 0;   b.orig.nch := 0;
+    NEW(b.append); b.append.len := 0; b.append.nch := 0;
     NEW(t);
     t.src := Orig; t.off := 0; t.len := 0;
     b.trailer  := t;
@@ -185,7 +205,7 @@ MODULE Buffer;
      res = NotFound: b is left empty (treat as a fresh file named `name`).
      res = IOError:  b is left empty; details lost. *)
     VAR f: Files.File; r: Files.Rider;
-        n, i: INTEGER; ch: CHAR; p: Piece;
+        n, i, ci, bi: INTEGER; ch: CHAR; p: Piece;
   BEGIN
     reset(b);
     f := Files.Old(name);
@@ -199,8 +219,13 @@ MODULE Buffer;
         Files.Set(r, f, 0);
         i := 0;
         WHILE i < n DO
+          ci := i DIV ChunkSize;
+          bi := i MOD ChunkSize;
+          IF ci >= b.orig.nch THEN
+            NEW(b.orig.chunks[b.orig.nch]); INC(b.orig.nch)
+          END;
           Files.Read(r, ch);
-          b.orig.bytes[i] := ch;
+          b.orig.chunks[ci].bytes[bi] := ch;
           INC(i)
         END;
         b.orig.len := n;
