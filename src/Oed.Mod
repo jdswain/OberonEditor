@@ -672,6 +672,8 @@ MODULE Oed;
     | TUI.KeyCtrlD:      DeleteCh;  SetStatus("")
     | TUI.KeyCtrlE:      MoveEnd;   SetStatus("")
     | TUI.KeyCtrlF:      MoveRight; SetStatus("")
+    | TUI.KeyCtrlN:      MoveDown;  SetStatus("")
+    | TUI.KeyCtrlP:      MoveUp;    SetStatus("")
     | TUI.KeyMetaLT:     MoveBufStart; SetStatus("")
     | TUI.KeyMetaGT:     MoveBufEnd;   SetStatus("")
     | TUI.KeyMetaF:      MoveWordForward;  SetStatus("")
