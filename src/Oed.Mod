@@ -1,16 +1,11 @@
 MODULE Oed;
-(* Editor shell wired to a Buffer. The viewport renders the buffer's
-   plain-ASCII content from `top` for Rows-2 rows; the cursor lives
-   as a buffer position `cur` and its screen coordinates are recovered
-   during the render walk. Editing routes printable keys, Enter,
-   Backspace and Delete through Buffer.Insert / Buffer.Delete.
+(* Editor shell. Globals mirror the current Viewer's state: buf,
+   lines and name come from the Viewer's Doc; cur, top and mark are
+   per-Viewer presentation state. The Doc/Viewer split — bytes
+   versus presentation — lives in Doc.Mod and Viewers.Mod, the first
+   step of the data-layer plan in doc/DataDDR.md. *)
 
-   Line walking (LineToPos, PosToColRow, LineLenFrom) is inline here
-   for now; it migrates to a separate Lines module once soft-wrap
-   arrives, since wrap turns "screen row" and "buffer line" into
-   different concepts. *)
-
-  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Buffers;
+  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Doc, Viewers;
 
   CONST
     ModeEntry   = 0;
@@ -524,13 +519,16 @@ MODULE Oed;
   END DoSave;
 
   PROCEDURE PromptSaveAs;
-    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; br: Buffers.BufRec;
+    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; v: Viewers.Viewer;
   BEGIN
     Mini.Prompt("Save as: ", fname, ok, NIL);
     IF ok & (fname[0] # 0X) THEN
       CopyStr(name, fname);
-      br := Buffers.Current();
-      IF br # NIL THEN br.name := name END;        (* keep registry in sync *)
+      v := Viewers.Current();
+      IF v # NIL THEN
+        CopyStr(v.doc.name, name);   (* canonical Doc name *)
+        CopyStr(v.label, name)       (* keep label in sync (v1: 1:1) *)
+      END;
       DoSave
     ELSE
       SetStatus("Save cancelled")
@@ -546,43 +544,43 @@ MODULE Oed;
     END
   END Save;
 
-  (* ---------------- multi-buffer plumbing ---------------- *)
+  (* ---------------- multi-viewer plumbing ---------------- *)
 
-  (* Sync globals from the registry's current buffer record. *)
+  (* Sync globals from the registry's current Viewer. The Doc owns
+     buf/lines/name; the Viewer owns cur/top/mark. *)
   PROCEDURE attachCurrent;
-    VAR br: Buffers.BufRec;
+    VAR v: Viewers.Viewer;
   BEGIN
-    br := Buffers.Current();
-    IF br # NIL THEN
-      buf   := br.buf;
-      lines := br.lines;
-      cur   := br.cur;
-      top   := br.top;
-      mark  := br.mark;
-      CopyStr(name, br.name)
+    v := Viewers.Current();
+    IF v # NIL THEN
+      buf   := v.doc.buf;
+      lines := v.doc.lines;
+      cur   := v.cur;
+      top   := v.top;
+      mark  := v.mark;
+      CopyStr(name, v.doc.name)
     END
   END attachCurrent;
 
-  (* Push the editor's globals back into the current buffer record so
-     a subsequent attach restores them. (buf, lines and name are
-     reference fields owned by the BufRec; only the moving editor
-     state cur/top/mark needs writing back here.) *)
+  (* Push the editor's cur/top/mark globals back into the current
+     Viewer so a subsequent attach restores them. The Doc fields
+     (buf/lines/name) are reference-shared and need no write-back. *)
   PROCEDURE detachCurrent;
-    VAR br: Buffers.BufRec;
+    VAR v: Viewers.Viewer;
   BEGIN
-    br := Buffers.Current();
-    IF br # NIL THEN
-      br.cur  := cur;
-      br.top  := top;
-      br.mark := mark
+    v := Viewers.Current();
+    IF v # NIL THEN
+      v.cur  := cur;
+      v.top  := top;
+      v.mark := mark
     END
   END detachCurrent;
 
-  PROCEDURE switchTo(target: Buffers.BufRec);
+  PROCEDURE switchTo(target: Viewers.Viewer);
   BEGIN
-    IF (target # NIL) & (target # Buffers.Current()) THEN
+    IF (target # NIL) & (target # Viewers.Current()) THEN
       detachCurrent;
-      Buffers.SetCurrent(target);
+      Viewers.SetCurrent(target);
       attachCurrent;
       (* Yank/kill chains are buffer-local; reset on switch. *)
       lastWasYank := FALSE;
@@ -590,38 +588,38 @@ MODULE Oed;
     END
   END switchTo;
 
-  PROCEDURE makeBuffer(VAR n: ARRAY OF CHAR): Buffers.BufRec;
-    VAR br: Buffers.BufRec;
+  (* Make a fresh Doc and a Viewer wrapping it, label = doc name.
+     Caller is responsible for Viewers.Add and any file load. *)
+  PROCEDURE makeViewer(VAR n: ARRAY OF CHAR): Viewers.Viewer;
+    VAR d: Doc.Doc;
   BEGIN
-    br := Buffers.New(n);
-    br.buf   := Buffer.New();
-    br.lines := Lines.New(br.buf);
-    RETURN br
-  END makeBuffer;
+    d := Doc.New(n);
+    RETURN Viewers.New(n, d, Viewers.KText)
+  END makeViewer;
 
   (* Tab-completion source for the buffer-switch prompt. Extends
-     `text` to the longest prefix shared by all buffer names that
+     `text` to the longest prefix shared by all viewer labels that
      start with text[0..len-1]. *)
   PROCEDURE bufferCompleter(VAR text: ARRAY OF CHAR; VAR len: INTEGER);
     VAR i, k, commonLen: INTEGER;
-        br: Buffers.BufRec;
+        v: Viewers.Viewer;
         first, matches: BOOLEAN;
         common: ARRAY 64 OF CHAR;
   BEGIN
     first := TRUE; commonLen := 0;
     i := 0;
-    WHILE i < Buffers.Count() DO
-      br := Buffers.At(i);
-      (* prefix match: br.name[0..len-1] = text[0..len-1] *)
+    WHILE i < Viewers.Count() DO
+      v := Viewers.At(i);
+      (* prefix match: v.label[0..len-1] = text[0..len-1] *)
       matches := TRUE;
       k := 0;
       WHILE matches & (k < len) DO
-        IF br.name[k] # text[k] THEN matches := FALSE END;
+        IF v.label[k] # text[k] THEN matches := FALSE END;
         INC(k)
       END;
       IF matches THEN
         IF first THEN
-          CopyStr(common, br.name);
+          CopyStr(common, v.label);
           commonLen := 0;
           WHILE (commonLen < LEN(common)) & (common[commonLen] # 0X) DO
             INC(commonLen)
@@ -629,7 +627,7 @@ MODULE Oed;
           first := FALSE
         ELSE
           k := 0;
-          WHILE (k < commonLen) & (common[k] = br.name[k]) DO INC(k) END;
+          WHILE (k < commonLen) & (common[k] = v.label[k]) DO INC(k) END;
           commonLen := k
         END
       END;
@@ -645,11 +643,11 @@ MODULE Oed;
 
   PROCEDURE PromptSwitchBuffer;
     VAR n: ARRAY NameLen OF CHAR; ok: BOOLEAN;
-        target: Buffers.BufRec;
+        target: Viewers.Viewer;
   BEGIN
     Mini.Prompt("Switch to buffer: ", n, ok, bufferCompleter);
     IF ok & (n[0] # 0X) THEN
-      target := Buffers.Find(n);
+      target := Viewers.Find(n);
       IF target # NIL THEN
         switchTo(target);
         SetStatus("Switched")
@@ -667,28 +665,28 @@ MODULE Oed;
      active; if the registry is empty, a fresh *scratch* takes over. *)
     VAR n, scratchName: ARRAY NameLen OF CHAR;
         ok, killing: BOOLEAN;
-        target, scratch: Buffers.BufRec;
+        target, scratch: Viewers.Viewer;
   BEGIN
     Mini.Prompt("Kill buffer: ", n, ok, bufferCompleter);
     IF ok THEN
-      IF n[0] = 0X THEN target := Buffers.Current()
-      ELSE target := Buffers.Find(n)
+      IF n[0] = 0X THEN target := Viewers.Current()
+      ELSE target := Viewers.Find(n)
       END;
       IF target = NIL THEN
         SetStatus("No such buffer")
       ELSE
         killing := TRUE;
-        IF target.buf.changed THEN
+        IF target.doc.buf.changed THEN
           killing := Mini.Confirm("Buffer modified. Kill anyway? (y/n) ")
         END;
         IF killing THEN
-          IF target = Buffers.Current() THEN detachCurrent END;
-          Buffers.Kill(target);
-          IF Buffers.Count() = 0 THEN
+          IF target = Viewers.Current() THEN detachCurrent END;
+          Viewers.Kill(target);
+          IF Viewers.Count() = 0 THEN
             CopyStr(scratchName, "*scratch*");
-            scratch := makeBuffer(scratchName);
-            Buffers.Add(scratch);
-            Buffers.SetCurrent(scratch)
+            scratch := makeViewer(scratchName);
+            Viewers.Add(scratch);
+            Viewers.SetCurrent(scratch)
           END;
           attachCurrent;
           lastWasYank := FALSE; lastWasKill := FALSE;
@@ -727,21 +725,10 @@ MODULE Oed;
     END
   END IntStr;
 
-  (* Append a single char to a NUL-terminated string. *)
-  PROCEDURE AppendCh(VAR dst: ARRAY OF CHAR; ch: CHAR);
-    VAR i: INTEGER;
-  BEGIN
-    i := 0;
-    WHILE (i < LEN(dst) - 1) & (dst[i] # 0X) DO INC(i) END;
-    IF i < LEN(dst) - 1 THEN
-      dst[i] := ch; dst[i+1] := 0X
-    END
-  END AppendCh;
-
-  (* Build *buffers* with one line per registered buffer and switch to
-     it. Re-runs each time so the listing is always current. *)
+  (* Build *buffers* with one line per registered viewer and switch
+     to it. Re-runs each time so the listing is always current. *)
   PROCEDURE ListBuffers;
-    VAR br, listBr: Buffers.BufRec;
+    VAR v, listV: Viewers.Viewer;
         i, n, k: INTEGER;
         line: ARRAY 128 OF CHAR;
         sizeStr: ARRAY 16 OF CHAR;
@@ -749,41 +736,41 @@ MODULE Oed;
         ch: CHAR;
   BEGIN
     CopyStr(listName, "*buffers*");
-    listBr := Buffers.Find(listName);
-    IF listBr = NIL THEN
-      listBr := makeBuffer(listName);
-      Buffers.Add(listBr)
+    listV := Viewers.Find(listName);
+    IF listV = NIL THEN
+      listV := makeViewer(listName);
+      Viewers.Add(listV)
     END;
 
     (* Wipe and repopulate. *)
-    Buffer.Delete(listBr.buf, 0, listBr.buf.len);
-    Lines.Invalidate(listBr.lines);
+    Buffer.Delete(listV.doc.buf, 0, listV.doc.buf.len);
+    Lines.Invalidate(listV.doc.lines);
     n := 0;
     i := 0;
-    WHILE i < Buffers.Count() DO
-      br := Buffers.At(i);
-      (* Format: "  <size>  <name><dirty>" *)
+    WHILE i < Viewers.Count() DO
+      v := Viewers.At(i);
+      (* Format: "  <size>  <label><dirty>" *)
       CopyStr(line, "  ");
-      IntStr(br.buf.len, sizeStr);
+      IntStr(v.doc.buf.len, sizeStr);
       AppendStr(line, sizeStr);
       AppendStr(line, "  ");
-      AppendStr(line, br.name);
-      IF br.buf.changed THEN AppendStr(line, " *") END;
+      AppendStr(line, v.label);
+      IF v.doc.buf.changed THEN AppendStr(line, " *") END;
       k := 0;
       WHILE (k < LEN(line)) & (line[k] # 0X) DO
         ch := line[k];
-        Buffer.Insert(listBr.buf, n, ch);
+        Buffer.Insert(listV.doc.buf, n, ch);
         INC(n); INC(k)
       END;
-      Buffer.Insert(listBr.buf, n, 0AX);    (* terminate the row *)
+      Buffer.Insert(listV.doc.buf, n, 0AX);   (* terminate the row *)
       INC(n);
       INC(i)
     END;
-    Lines.Invalidate(listBr.lines);
-    listBr.buf.changed := FALSE;            (* listing is not user-modified *)
-    listBr.cur := 0; listBr.top := 0;
+    Lines.Invalidate(listV.doc.lines);
+    listV.doc.buf.changed := FALSE;            (* listing is not user-modified *)
+    listV.cur := 0; listV.top := 0;
 
-    switchTo(listBr);
+    switchTo(listV);
     SetStatus("Buffer list")
   END ListBuffers;
 
@@ -792,17 +779,17 @@ MODULE Oed;
      count, plus any failures. *)
   PROCEDURE SaveAll;
     VAR i, saved, failed, res: INTEGER;
-        br: Buffers.BufRec;
+        v: Viewers.Viewer;
         msg: ARRAY 96 OF CHAR;
         countStr: ARRAY 16 OF CHAR;
   BEGIN
-    detachCurrent;          (* flush cur/top/mark to current's BufRec *)
+    detachCurrent;          (* flush cur/top/mark to current Viewer *)
     saved := 0; failed := 0;
     i := 0;
-    WHILE i < Buffers.Count() DO
-      br := Buffers.At(i);
-      IF br.buf.changed & (br.name[0] # 0X) & (br.name[0] # "*") THEN
-        Buffer.Save(br.buf, br.name, res);
+    WHILE i < Viewers.Count() DO
+      v := Viewers.At(i);
+      IF v.doc.buf.changed & (v.doc.name[0] # 0X) & (v.doc.name[0] # "*") THEN
+        Buffer.Save(v.doc.buf, v.doc.name, res);
         IF res = Buffer.Ok THEN INC(saved) ELSE INC(failed) END
       END;
       INC(i)
@@ -818,20 +805,21 @@ MODULE Oed;
   END SaveAll;
 
   PROCEDURE PromptOpen;
-  (* Open creates a new buffer (or switches to one already visiting
-     the file). Current buffer's unsaved changes are preserved — they
-     stay in the previous BufRec, just no longer the active one. *)
+  (* Open creates a new Viewer (and Doc) for the file, or switches to
+     an existing Viewer already visiting that filename. Current
+     buffer's unsaved changes are preserved — they stay in their
+     existing Viewer/Doc, just no longer the active one. *)
     VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; res: INTEGER;
-        target: Buffers.BufRec;
+        target: Viewers.Viewer;
   BEGIN
     Mini.Prompt("Open: ", fname, ok, NIL);
     IF ok & (fname[0] # 0X) THEN
-      target := Buffers.Find(fname);
+      target := Viewers.FindByDocName(fname);
       IF target = NIL THEN
-        target := makeBuffer(fname);
-        Buffer.Load(target.buf, fname, res);
-        Lines.Invalidate(target.lines);
-        Buffers.Add(target);
+        target := makeViewer(fname);
+        Buffer.Load(target.doc.buf, fname, res);
+        Lines.Invalidate(target.doc.lines);
+        Viewers.Add(target);
         IF res = Buffer.Ok THEN SetStatus("Opened")
         ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
         ELSE SetStatus("Open failed")
@@ -1095,16 +1083,17 @@ MODULE Oed;
     IF ~isKillCmd THEN lastWasKill := FALSE END
   END EntryKey;
 
-  (* Any buffer in the registry holding unsaved changes? Used by the
-     quit guard so unsaved work in a non-current buffer still warns. *)
+  (* Any viewer in the registry whose Doc has unsaved changes? Used
+     by the quit guard so unsaved work in a non-current viewer still
+     warns. *)
   PROCEDURE anyBufferDirty(): BOOLEAN;
-    VAR i: INTEGER; dirty: BOOLEAN; br: Buffers.BufRec;
+    VAR i: INTEGER; dirty: BOOLEAN; v: Viewers.Viewer;
   BEGIN
-    detachCurrent;       (* make sure cur/top/mark are flushed; .changed is a Buffer field already current *)
+    detachCurrent;       (* flush cur/top/mark; .changed is on the Doc's Buffer *)
     dirty := FALSE; i := 0;
-    WHILE ~dirty & (i < Buffers.Count()) DO
-      br := Buffers.At(i);
-      IF br.buf.changed THEN dirty := TRUE END;
+    WHILE ~dirty & (i < Viewers.Count()) DO
+      v := Viewers.At(i);
+      IF v.doc.buf.changed THEN dirty := TRUE END;
       INC(i)
     END;
     RETURN dirty
@@ -1148,20 +1137,24 @@ MODULE Oed;
   END Process;
 
   PROCEDURE LoadInitialFile;
-  (* If argv[1] was given, open it as a new buffer and switch to it. *)
+  (* If argv[1] was given, open it as a new Viewer (or switch to one
+     already visiting that file) and switch to it. *)
     VAR fname: ARRAY NameLen OF CHAR; res: INTEGER;
-        target: Buffers.BufRec;
+        target: Viewers.Viewer;
   BEGIN
     IF Env.ArgCount() > 1 THEN
       Env.Arg(1, fname);
       IF fname[0] # 0X THEN
-        target := makeBuffer(fname);
-        Buffer.Load(target.buf, fname, res);
-        Lines.Invalidate(target.lines);
-        Buffers.Add(target);
-        IF res = Buffer.Ok THEN SetStatus("Opened")
-        ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
-        ELSE SetStatus("Open failed")
+        target := Viewers.FindByDocName(fname);
+        IF target = NIL THEN
+          target := makeViewer(fname);
+          Buffer.Load(target.doc.buf, fname, res);
+          Lines.Invalidate(target.doc.lines);
+          Viewers.Add(target);
+          IF res = Buffer.Ok THEN SetStatus("Opened")
+          ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
+          ELSE SetStatus("Open failed")
+          END
         END;
         switchTo(target)
       END
@@ -1169,16 +1162,17 @@ MODULE Oed;
   END LoadInitialFile;
 
   PROCEDURE Run;
-    VAR scratch: Buffers.BufRec;
+    VAR scratch: Viewers.Viewer;
         scratchName: ARRAY NameLen OF CHAR;
   BEGIN
     TUI.Init;
-    (* Always start with a *scratch* buffer so the editor has a current
-       buffer even with no argv. argv-driven Open layers on top. *)
+    (* Always start with a *scratch* viewer so the editor has a
+       current viewer even with no argv. argv-driven Open layers on
+       top. *)
     CopyStr(scratchName, "*scratch*");
-    scratch := makeBuffer(scratchName);
-    Buffers.Add(scratch);
-    Buffers.SetCurrent(scratch);
+    scratch := makeViewer(scratchName);
+    Viewers.Add(scratch);
+    Viewers.SetCurrent(scratch);
     attachCurrent;
 
     killHead    := 0;

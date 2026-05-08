@@ -23,7 +23,7 @@ all: $(BIN)/oed $(BIN)/tuitest $(BIN)/buftest $(BIN)/linestest
 $(BIN):
 	mkdir -p $(BIN)
 
-$(BIN)/oed: $(SRC)/Oed.Mod $(SRC)/TUI.Mod $(SRC)/Buffer.Mod $(SRC)/Lines.Mod $(SRC)/Mini.Mod $(SRC)/TUI_rt.c | $(BIN)
+$(BIN)/oed: $(SRC)/Oed.Mod $(SRC)/TUI.Mod $(SRC)/Buffer.Mod $(SRC)/Lines.Mod $(SRC)/Mini.Mod $(SRC)/Doc.Mod $(SRC)/Viewers.Mod $(SRC)/TUI_rt.c | $(BIN)
 	$(OC) -o $@ $(SRC)/Oed.Mod $(RUNTIMES)
 
 $(BIN)/tuitest: $(SRC)/TUITest.Mod $(SRC)/TUI.Mod $(SRC)/TUI_rt.c | $(BIN)
