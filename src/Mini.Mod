@@ -13,6 +13,12 @@ MODULE Mini;
 
   IMPORT TUI;
 
+  TYPE
+    (* Tab-completion callback. The current input lives in
+       text[0..len-1] (NUL-terminated). The implementation may extend
+       it in place by writing more characters and increasing len. *)
+    Completer* = PROCEDURE(VAR text: ARRAY OF CHAR; VAR len: INTEGER);
+
   PROCEDURE StrLen(s: ARRAY OF CHAR): INTEGER;
     VAR i: INTEGER;
   BEGIN
@@ -23,9 +29,10 @@ MODULE Mini;
 
   (* Read a line of text from the user on the message line.
      Returns ok = TRUE with result NUL-terminated on Enter; ok = FALSE
-     on Escape. Supports Backspace, Ctrl-H, arrow keys, Home, End. *)
+     on Escape. Supports Backspace, Ctrl-H, arrow keys, Home, End.
+     If `complete` is non-NIL, Tab invokes it for completion. *)
   PROCEDURE Prompt*(prompt: ARRAY OF CHAR; VAR result: ARRAY OF CHAR;
-                    VAR ok: BOOLEAN);
+                    VAR ok: BOOLEAN; complete: Completer);
     CONST MaxText = 256;
     VAR text: ARRAY MaxText OF CHAR;
         len, mbCur: INTEGER;
@@ -53,6 +60,11 @@ MODULE Mini;
           i := mbCur;
           WHILE i < len DO text[i-1] := text[i]; INC(i) END;
           DEC(len); DEC(mbCur); text[len] := 0X
+        END
+      ELSIF k = TUI.KeyTab THEN
+        IF complete # NIL THEN
+          complete(text, len);
+          mbCur := len
         END
       ELSIF k = TUI.KeyArrowLeft THEN
         IF mbCur > 0 THEN DEC(mbCur) END

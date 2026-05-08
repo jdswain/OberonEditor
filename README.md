@@ -108,16 +108,17 @@ the key on most terminals).
 | `C-y` | yank most recent kill |
 | `M-y` | yank-pop (after `C-y` or `M-y`): replace with next-older entry |
 
-### Files / quit
+### Files / buffers / quit
 
-The Ctrl-X prefix gates the destructive commands.
+The Ctrl-X prefix gates buffer- and file-level commands.
 
 | Key | Action |
 |---|---|
-| `C-x C-s` | save (prompts for filename if buffer has none) |
+| `C-x C-s` | save (prompts for filename if buffer has none, or if its name is internal like `*scratch*`) |
 | `C-x C-w` | save as (always prompts) |
-| `C-x C-f` | open file (with discard-unsaved guard) |
-| `C-x C-c` | quit (with discard-unsaved guard) |
+| `C-x C-f` | open file in a new buffer (or switch to existing buffer for that file) |
+| `C-x b`   | switch to a named buffer; Tab completes against the buffer list |
+| `C-x C-c` | quit (warns if any buffer has unsaved changes, not just the current one) |
 
 ## Architecture
 

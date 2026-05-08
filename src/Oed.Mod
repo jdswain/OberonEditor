@@ -10,7 +10,7 @@ MODULE Oed;
    arrives, since wrap turns "screen row" and "buffer line" into
    different concepts. *)
 
-  IMPORT TUI, Buffer, Lines, Env, Mini, Files;
+  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Buffers;
 
   CONST
     ModeEntry   = 0;
@@ -524,11 +524,13 @@ MODULE Oed;
   END DoSave;
 
   PROCEDURE PromptSaveAs;
-    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN;
+    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; br: Buffers.BufRec;
   BEGIN
-    Mini.Prompt("Save as: ", fname, ok);
+    Mini.Prompt("Save as: ", fname, ok, NIL);
     IF ok & (fname[0] # 0X) THEN
       CopyStr(name, fname);
+      br := Buffers.Current();
+      IF br # NIL THEN br.name := name END;        (* keep registry in sync *)
       DoSave
     ELSE
       SetStatus("Save cancelled")
@@ -537,32 +539,151 @@ MODULE Oed;
 
   PROCEDURE Save;
   BEGIN
-    IF name[0] = 0X THEN PromptSaveAs ELSE DoSave END
+    (* Buffers without a file (empty name) and "internal" buffers
+       conventionally named *foo* both need a real filename prompt. *)
+    IF (name[0] = 0X) OR (name[0] = "*") THEN PromptSaveAs
+    ELSE DoSave
+    END
   END Save;
 
-  PROCEDURE PromptOpen;
-    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; res: INTEGER;
-        proceed: BOOLEAN;
+  (* ---------------- multi-buffer plumbing ---------------- *)
+
+  (* Sync globals from the registry's current buffer record. *)
+  PROCEDURE attachCurrent;
+    VAR br: Buffers.BufRec;
   BEGIN
-    IF buf.changed THEN proceed := Mini.Confirm("Discard unsaved changes? (y/n) ")
-    ELSE proceed := TRUE
-    END;
-    IF proceed THEN
-      Mini.Prompt("Open: ", fname, ok);
-      IF ok & (fname[0] # 0X) THEN
-        Buffer.Load(buf, fname, res);
-        Lines.Invalidate(lines);
-        cur := 0; top := 0;
-        IF res = Buffer.Ok THEN
-          CopyStr(name, fname); SetStatus("Opened")
-        ELSIF res = Buffer.NotFound THEN
-          CopyStr(name, fname); SetStatus("(new file)")
+    br := Buffers.Current();
+    IF br # NIL THEN
+      buf   := br.buf;
+      lines := br.lines;
+      cur   := br.cur;
+      top   := br.top;
+      mark  := br.mark;
+      CopyStr(name, br.name)
+    END
+  END attachCurrent;
+
+  (* Push the editor's globals back into the current buffer record so
+     a subsequent attach restores them. (buf, lines and name are
+     reference fields owned by the BufRec; only the moving editor
+     state cur/top/mark needs writing back here.) *)
+  PROCEDURE detachCurrent;
+    VAR br: Buffers.BufRec;
+  BEGIN
+    br := Buffers.Current();
+    IF br # NIL THEN
+      br.cur  := cur;
+      br.top  := top;
+      br.mark := mark
+    END
+  END detachCurrent;
+
+  PROCEDURE switchTo(target: Buffers.BufRec);
+  BEGIN
+    IF (target # NIL) & (target # Buffers.Current()) THEN
+      detachCurrent;
+      Buffers.SetCurrent(target);
+      attachCurrent;
+      (* Yank/kill chains are buffer-local; reset on switch. *)
+      lastWasYank := FALSE;
+      lastWasKill := FALSE
+    END
+  END switchTo;
+
+  PROCEDURE makeBuffer(VAR n: ARRAY OF CHAR): Buffers.BufRec;
+    VAR br: Buffers.BufRec;
+  BEGIN
+    br := Buffers.New(n);
+    br.buf   := Buffer.New();
+    br.lines := Lines.New(br.buf);
+    RETURN br
+  END makeBuffer;
+
+  (* Tab-completion source for the buffer-switch prompt. Extends
+     `text` to the longest prefix shared by all buffer names that
+     start with text[0..len-1]. *)
+  PROCEDURE bufferCompleter(VAR text: ARRAY OF CHAR; VAR len: INTEGER);
+    VAR i, k, commonLen: INTEGER;
+        br: Buffers.BufRec;
+        first, matches: BOOLEAN;
+        common: ARRAY 64 OF CHAR;
+  BEGIN
+    first := TRUE; commonLen := 0;
+    i := 0;
+    WHILE i < Buffers.Count() DO
+      br := Buffers.At(i);
+      (* prefix match: br.name[0..len-1] = text[0..len-1] *)
+      matches := TRUE;
+      k := 0;
+      WHILE matches & (k < len) DO
+        IF br.name[k] # text[k] THEN matches := FALSE END;
+        INC(k)
+      END;
+      IF matches THEN
+        IF first THEN
+          CopyStr(common, br.name);
+          commonLen := 0;
+          WHILE (commonLen < LEN(common)) & (common[commonLen] # 0X) DO
+            INC(commonLen)
+          END;
+          first := FALSE
         ELSE
-          name[0] := 0X; SetStatus("Open failed")
+          k := 0;
+          WHILE (k < commonLen) & (common[k] = br.name[k]) DO INC(k) END;
+          commonLen := k
+        END
+      END;
+      INC(i)
+    END;
+    IF ~first & (commonLen > len) THEN
+      k := 0;
+      WHILE k < commonLen DO text[k] := common[k]; INC(k) END;
+      text[commonLen] := 0X;
+      len := commonLen
+    END
+  END bufferCompleter;
+
+  PROCEDURE PromptSwitchBuffer;
+    VAR n: ARRAY NameLen OF CHAR; ok: BOOLEAN;
+        target: Buffers.BufRec;
+  BEGIN
+    Mini.Prompt("Switch to buffer: ", n, ok, bufferCompleter);
+    IF ok & (n[0] # 0X) THEN
+      target := Buffers.Find(n);
+      IF target # NIL THEN
+        switchTo(target);
+        SetStatus("Switched")
+      ELSE
+        SetStatus("No such buffer")
+      END
+    ELSE
+      SetStatus("Switch cancelled")
+    END
+  END PromptSwitchBuffer;
+
+  PROCEDURE PromptOpen;
+  (* Open creates a new buffer (or switches to one already visiting
+     the file). Current buffer's unsaved changes are preserved — they
+     stay in the previous BufRec, just no longer the active one. *)
+    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; res: INTEGER;
+        target: Buffers.BufRec;
+  BEGIN
+    Mini.Prompt("Open: ", fname, ok, NIL);
+    IF ok & (fname[0] # 0X) THEN
+      target := Buffers.Find(fname);
+      IF target = NIL THEN
+        target := makeBuffer(fname);
+        Buffer.Load(target.buf, fname, res);
+        Lines.Invalidate(target.lines);
+        Buffers.Add(target);
+        IF res = Buffer.Ok THEN SetStatus("Opened")
+        ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
+        ELSE SetStatus("Open failed")
         END
       ELSE
-        SetStatus("Open cancelled")
-      END
+        SetStatus("Switched to existing buffer")
+      END;
+      switchTo(target)
     ELSE
       SetStatus("Open cancelled")
     END
@@ -818,10 +939,25 @@ MODULE Oed;
     IF ~isKillCmd THEN lastWasKill := FALSE END
   END EntryKey;
 
+  (* Any buffer in the registry holding unsaved changes? Used by the
+     quit guard so unsaved work in a non-current buffer still warns. *)
+  PROCEDURE anyBufferDirty(): BOOLEAN;
+    VAR i: INTEGER; dirty: BOOLEAN; br: Buffers.BufRec;
+  BEGIN
+    detachCurrent;       (* make sure cur/top/mark are flushed; .changed is a Buffer field already current *)
+    dirty := FALSE; i := 0;
+    WHILE ~dirty & (i < Buffers.Count()) DO
+      br := Buffers.At(i);
+      IF br.buf.changed THEN dirty := TRUE END;
+      INC(i)
+    END;
+    RETURN dirty
+  END anyBufferDirty;
+
   PROCEDURE CommandKey(k: INTEGER);
   BEGIN
     IF k = TUI.KeyCtrlC THEN
-      IF ~buf.changed OR Mini.Confirm("Discard unsaved changes? (y/n) ") THEN
+      IF ~anyBufferDirty() OR Mini.Confirm("Discard unsaved changes? (y/n) ") THEN
         running := FALSE
       ELSE
         SetStatus("Quit cancelled")
@@ -832,6 +968,8 @@ MODULE Oed;
       PromptSaveAs
     ELSIF k = TUI.KeyCtrlF THEN
       PromptOpen
+    ELSIF k = ORD("b") THEN
+      PromptSwitchBuffer
     ELSE
       SetStatus("Command cancelled")
     END;
@@ -848,36 +986,39 @@ MODULE Oed;
   END Process;
 
   PROCEDURE LoadInitialFile;
-  (* If argv[1] was given, open it as the editor's initial buffer.
-     Treat NotFound the same as Open does: keep the name so the next
-     save creates the file, and report it on the message line. *)
+  (* If argv[1] was given, open it as a new buffer and switch to it. *)
     VAR fname: ARRAY NameLen OF CHAR; res: INTEGER;
+        target: Buffers.BufRec;
   BEGIN
     IF Env.ArgCount() > 1 THEN
       Env.Arg(1, fname);
       IF fname[0] # 0X THEN
-        Buffer.Load(buf, fname, res);
-        Lines.Invalidate(lines);
-        IF res = Buffer.Ok THEN
-          CopyStr(name, fname); SetStatus("Opened")
-        ELSIF res = Buffer.NotFound THEN
-          CopyStr(name, fname); SetStatus("(new file)")
-        ELSE
-          SetStatus("Open failed")
-        END
+        target := makeBuffer(fname);
+        Buffer.Load(target.buf, fname, res);
+        Lines.Invalidate(target.lines);
+        Buffers.Add(target);
+        IF res = Buffer.Ok THEN SetStatus("Opened")
+        ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
+        ELSE SetStatus("Open failed")
+        END;
+        switchTo(target)
       END
     END
   END LoadInitialFile;
 
   PROCEDURE Run;
+    VAR scratch: Buffers.BufRec;
+        scratchName: ARRAY NameLen OF CHAR;
   BEGIN
     TUI.Init;
-    buf     := Buffer.New();
-    lines   := Lines.New(buf);
-    cur     := 0;
-    top     := 0;
-    name[0] := 0X;
-    mark        := -1;
+    (* Always start with a *scratch* buffer so the editor has a current
+       buffer even with no argv. argv-driven Open layers on top. *)
+    CopyStr(scratchName, "*scratch*");
+    scratch := makeBuffer(scratchName);
+    Buffers.Add(scratch);
+    Buffers.SetCurrent(scratch);
+    attachCurrent;
+
     killHead    := 0;
     killCount   := 0;
     yankIndex   := 0;
@@ -886,13 +1027,14 @@ MODULE Oed;
     lastWasYank := FALSE;
     lastWasKill := FALSE;
     mode        := ModeEntry;
-    running := TRUE;
-    SetStatus("HELP: Ctrl-X then Ctrl-S save, Ctrl-W save-as, Ctrl-F open, Ctrl-C quit");
+    running     := TRUE;
+    SetStatus("HELP: Ctrl-X then Ctrl-S save, Ctrl-W save-as, Ctrl-F open, b switch buffer, Ctrl-C quit");
     LoadInitialFile;
     WHILE running DO
       Refresh;
       Process
     END;
+    detachCurrent;
     TUI.Clear;
     TUI.Flush;
     TUI.Shutdown

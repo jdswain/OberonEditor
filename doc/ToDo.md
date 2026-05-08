@@ -32,6 +32,10 @@ x Incremental update on edit. `Lines.Inserted(pos, count)` and `Lines.Deleted(be
 - **Escape-sequence timeout is 100 ms.** Local PTY is fine. Slow ttys / high-latency SSH could split a real Meta press into bare Esc plus the printable.
 - **C-Space sends NUL on most terminals but not all.** Documented in the `KeyCtrlSpace` constant. If it bites, fall back to `M-Space` or similar.
 
+## Compiler bugs found & fixed
+
+x **Procedure values lowered to NIL.** `LoadItem` in `ORG.c` sent procedure-typed `ORB_Const` items through `ConstOfType`, which collapses any pointer type to `NULL`. Result: `var := someProc`, `Call(someProc)`, and any procedure-passed-as-parameter all silently became NIL. Fixed by short-circuiting in `LoadItem` to use `x->backend` when the type form is `ORB_Proc`. Repro: a one-liner `h := Foo` showed `store ptr null` instead of `store ptr @Foo` in the IR.
+
 ## Compiler quirks (workarounds in place)
 
 - **`Piece*` and `PieceDesc*` exported from Buffer**, fields private. Workaround for an `oc` front-end crash: a hidden record-type with a `WEAK POINTER` self-reference, used as a field of an exported pointer type, segfaults the importer. Reproduced minimally; documented in Buffer.Mod.
