@@ -116,6 +116,7 @@ The Ctrl-X prefix gates buffer- and file-level commands.
 |---|---|
 | `C-x C-s` | save (prompts for filename if buffer has none, or if its name is internal like `*scratch*`) |
 | `C-x C-w` | save as (always prompts) |
+| `C-x s`   | save all dirty buffers that have a real filename (skips internal `*foo*` ones) |
 | `C-x C-f` | open file in a new buffer (or switch to existing buffer for that file) |
 | `C-x b`   | switch to a named buffer; Tab completes against the buffer list |
 | `C-x k`   | kill a buffer (default current; confirms if dirty) |

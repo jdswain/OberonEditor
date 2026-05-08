@@ -787,6 +787,36 @@ MODULE Oed;
     SetStatus("Buffer list")
   END ListBuffers;
 
+  (* C-x s: save every dirty buffer that has a real filename. Skips
+     internal/*-named buffers and any with no name. Reports the
+     count, plus any failures. *)
+  PROCEDURE SaveAll;
+    VAR i, saved, failed, res: INTEGER;
+        br: Buffers.BufRec;
+        msg: ARRAY 96 OF CHAR;
+        countStr: ARRAY 16 OF CHAR;
+  BEGIN
+    detachCurrent;          (* flush cur/top/mark to current's BufRec *)
+    saved := 0; failed := 0;
+    i := 0;
+    WHILE i < Buffers.Count() DO
+      br := Buffers.At(i);
+      IF br.buf.changed & (br.name[0] # 0X) & (br.name[0] # "*") THEN
+        Buffer.Save(br.buf, br.name, res);
+        IF res = Buffer.Ok THEN INC(saved) ELSE INC(failed) END
+      END;
+      INC(i)
+    END;
+    CopyStr(msg, "Saved ");
+    IntStr(saved, countStr); AppendStr(msg, countStr);
+    IF failed > 0 THEN
+      AppendStr(msg, ", ");
+      IntStr(failed, countStr); AppendStr(msg, countStr);
+      AppendStr(msg, " failed")
+    END;
+    SetStatus(msg)
+  END SaveAll;
+
   PROCEDURE PromptOpen;
   (* Open creates a new buffer (or switches to one already visiting
      the file). Current buffer's unsaved changes are preserved — they
@@ -1098,6 +1128,8 @@ MODULE Oed;
       PromptSwitchBuffer
     ELSIF k = ORD("k") THEN
       PromptKillBuffer
+    ELSIF k = ORD("s") THEN
+      SaveAll
     ELSIF k = TUI.KeyCtrlB THEN
       ListBuffers
     ELSE
