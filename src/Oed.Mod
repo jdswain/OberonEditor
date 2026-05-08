@@ -526,8 +526,9 @@ MODULE Oed;
       CopyStr(name, fname);
       v := Viewers.Current();
       IF v # NIL THEN
-        CopyStr(v.doc.name, name);   (* canonical Doc name *)
-        CopyStr(v.label, name)       (* keep label in sync (v1: 1:1) *)
+        CopyStr(v.doc.name, name);     (* canonical Doc name *)
+        CopyStr(v.label, name);        (* keep label in sync (v1: 1:1) *)
+        v.kind := Viewers.KindOf(name) (* extension may have changed *)
       END;
       DoSave
     ELSE
@@ -588,13 +589,14 @@ MODULE Oed;
     END
   END switchTo;
 
-  (* Make a fresh Doc and a Viewer wrapping it, label = doc name.
-     Caller is responsible for Viewers.Add and any file load. *)
+  (* Make a fresh Doc and a Viewer wrapping it, label = doc name,
+     kind derived from the filename extension. Caller is responsible
+     for Viewers.Add and any file load. *)
   PROCEDURE makeViewer(VAR n: ARRAY OF CHAR): Viewers.Viewer;
     VAR d: Doc.Doc;
   BEGIN
     d := Doc.New(n);
-    RETURN Viewers.New(n, d, Viewers.KText)
+    RETURN Viewers.New(n, d, Viewers.KindOf(n))
   END makeViewer;
 
   (* Tab-completion source for the buffer-switch prompt. Extends
@@ -832,6 +834,48 @@ MODULE Oed;
       SetStatus("Open cancelled")
     END
   END PromptOpen;
+
+  PROCEDURE PromptOpenRawText;
+  (* C-x C-r: open as raw text regardless of extension. If a Doc for
+     the path is already loaded by another (structured) Viewer, share
+     the Doc and create a sibling kText Viewer with a "<text>" suffix
+     in its label so the buffer list distinguishes the two. If the
+     existing Viewer is already kText we just switch to it. *)
+    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; res: INTEGER;
+        target, existing: Viewers.Viewer;
+        textLabel: ARRAY 96 OF CHAR;
+  BEGIN
+    Mini.Prompt("Find file as text: ", fname, ok, NIL);
+    IF ok & (fname[0] # 0X) THEN
+      existing := Viewers.FindByDocName(fname);
+      IF existing = NIL THEN
+        target := Viewers.New(fname, Doc.New(fname), Viewers.KText);
+        Buffer.Load(target.doc.buf, fname, res);
+        Lines.Invalidate(target.doc.lines);
+        Viewers.Add(target);
+        IF res = Buffer.Ok THEN SetStatus("Opened as text")
+        ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
+        ELSE SetStatus("Open failed")
+        END;
+        switchTo(target)
+      ELSIF existing.kind = Viewers.KText THEN
+        switchTo(existing);
+        SetStatus("Switched to existing buffer")
+      ELSE
+        CopyStr(textLabel, fname);
+        AppendStr(textLabel, "<text>");
+        target := Viewers.Find(textLabel);
+        IF target = NIL THEN
+          target := Viewers.New(textLabel, existing.doc, Viewers.KText);
+          Viewers.Add(target)
+        END;
+        switchTo(target);
+        SetStatus("Opened as text")
+      END
+    ELSE
+      SetStatus("Open cancelled")
+    END
+  END PromptOpenRawText;
 
   (* ---------------- rendering ---------------- *)
 
@@ -1113,6 +1157,8 @@ MODULE Oed;
       PromptSaveAs
     ELSIF k = TUI.KeyCtrlF THEN
       PromptOpen
+    ELSIF k = TUI.KeyCtrlR THEN
+      PromptOpenRawText
     ELSIF k = ORD("b") THEN
       PromptSwitchBuffer
     ELSIF k = ORD("k") THEN

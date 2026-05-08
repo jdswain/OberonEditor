@@ -48,6 +48,38 @@ MODULE Viewers;
     RETURN a[i] = b[i]
   END strEq;
 
+  PROCEDURE KindOf*(VAR name: ARRAY OF CHAR): INTEGER;
+  (* Map a filename to a Viewer kind by extension. The basename's
+     last dot is the source of truth; paths like "/foo.col/bar" are
+     classified by "bar"'s extension (none → kText), not "foo.col".
+     Synthetic names like "*scratch*" have no dot → kText.
+
+     Step 2 of the data-layer plan: every viewer is still functionally
+     kText, but the kind field is populated correctly so per-kind
+     dispatch can layer on without touching the open paths again. *)
+    VAR i, dot, lastSlash, extLen, k: INTEGER;
+  BEGIN
+    i := 0; dot := -1; lastSlash := -1;
+    WHILE (i < LEN(name)) & (name[i] # 0X) DO
+      IF name[i] = "/" THEN lastSlash := i; dot := -1
+      ELSIF name[i] = "." THEN dot := i
+      END;
+      INC(i)
+    END;
+    k := KText;
+    IF (dot > lastSlash) & (dot >= 0) THEN
+      extLen := i - dot - 1;
+      IF extLen = 3 THEN
+        IF    (name[dot+1] = "c") & (name[dot+2] = "o") & (name[dot+3] = "l") THEN k := KCollection
+        ELSIF (name[dot+1] = "t") & (name[dot+2] = "b") & (name[dot+3] = "l") THEN k := KTableView
+        ELSIF (name[dot+1] = "s") & (name[dot+2] = "s") & (name[dot+3] = "h") THEN k := KSpreadsheetView
+        ELSIF (name[dot+1] = "f") & (name[dot+2] = "r") & (name[dot+3] = "m") THEN k := KFormView
+        END
+      END
+    END;
+    RETURN k
+  END KindOf;
+
   PROCEDURE New*(label: ARRAY OF CHAR; d: Doc.Doc; kind: INTEGER): Viewer;
   (* Allocate a fresh Viewer wrapping doc d. Caller adds via Add. *)
     VAR v: Viewer; i: INTEGER;
