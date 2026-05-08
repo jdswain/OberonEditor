@@ -5,7 +5,7 @@ MODULE Oed;
    versus presentation — lives in Doc.Mod and Viewers.Mod, the first
    step of the data-layer plan in doc/DataDDR.md. *)
 
-  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Doc, Viewers;
+  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Doc, Viewers, Project;
 
   CONST
     ModeEntry   = 0;
@@ -527,7 +527,7 @@ MODULE Oed;
       v := Viewers.Current();
       IF v # NIL THEN
         CopyStr(v.doc.name, name);     (* canonical Doc name *)
-        CopyStr(v.label, name);        (* keep label in sync (v1: 1:1) *)
+        Project.Logical(name, v.label);(* refresh display label *)
         v.kind := Viewers.KindOf(name) (* extension may have changed *)
       END;
       DoSave
@@ -589,14 +589,17 @@ MODULE Oed;
     END
   END switchTo;
 
-  (* Make a fresh Doc and a Viewer wrapping it, label = doc name,
-     kind derived from the filename extension. Caller is responsible
-     for Viewers.Add and any file load. *)
+  (* Make a fresh Doc and a Viewer wrapping it. Doc keeps the
+     physical (canonical) path as its name; the Viewer's label is
+     the project-logical abbreviation when the file lives under the
+     root (e.g. "/Objects/Foo.col"), or the physical path otherwise.
+     Synthetic "*foo*" names pass through unchanged. *)
   PROCEDURE makeViewer(VAR n: ARRAY OF CHAR): Viewers.Viewer;
-    VAR d: Doc.Doc;
+    VAR d: Doc.Doc; label: ARRAY NameLen OF CHAR;
   BEGIN
     d := Doc.New(n);
-    RETURN Viewers.New(n, d, Viewers.KindOf(n))
+    Project.Logical(n, label);
+    RETURN Viewers.New(label, d, Viewers.KindOf(n))
   END makeViewer;
 
   (* Tab-completion source for the buffer-switch prompt. Extends
@@ -849,7 +852,8 @@ MODULE Oed;
     IF ok & (fname[0] # 0X) THEN
       existing := Viewers.FindByDocName(fname);
       IF existing = NIL THEN
-        target := Viewers.New(fname, Doc.New(fname), Viewers.KText);
+        Project.Logical(fname, textLabel);
+        target := Viewers.New(textLabel, Doc.New(fname), Viewers.KText);
         Buffer.Load(target.doc.buf, fname, res);
         Lines.Invalidate(target.doc.lines);
         Viewers.Add(target);
@@ -862,7 +866,7 @@ MODULE Oed;
         switchTo(existing);
         SetStatus("Switched to existing buffer")
       ELSE
-        CopyStr(textLabel, fname);
+        Project.Logical(existing.doc.name, textLabel);
         AppendStr(textLabel, "<text>");
         target := Viewers.Find(textLabel);
         IF target = NIL THEN
@@ -930,7 +934,7 @@ MODULE Oed;
     IF name[0] = 0X THEN
       displayName := "[No File]"
     ELSE
-      displayName := name
+      Project.Logical(name, displayName)
     END;
     TUI.WriteStr(displayName);
     IF buf.changed THEN TUI.WriteStr(" *") END;
@@ -1209,9 +1213,19 @@ MODULE Oed;
 
   PROCEDURE Run;
     VAR scratch: Viewers.Viewer;
-        scratchName: ARRAY NameLen OF CHAR;
+        scratchName, initStart: ARRAY NameLen OF CHAR;
   BEGIN
     TUI.Init;
+    (* Establish project root before any file open: walks up from
+       dirname(argv[1]) (or cwd if no argv) looking for a .oed/
+       marker. *)
+    IF Env.ArgCount() > 1 THEN
+      Env.Arg(1, initStart)
+    ELSE
+      initStart[0] := 0X
+    END;
+    Project.Init(initStart);
+
     (* Always start with a *scratch* viewer so the editor has a
        current viewer even with no argv. argv-driven Open layers on
        top. *)
