@@ -661,6 +661,132 @@ MODULE Oed;
     END
   END PromptSwitchBuffer;
 
+  PROCEDURE PromptKillBuffer;
+  (* Empty input kills the current buffer. Confirms before discarding
+     unsaved changes. After kill, the registry's new current becomes
+     active; if the registry is empty, a fresh *scratch* takes over. *)
+    VAR n, scratchName: ARRAY NameLen OF CHAR;
+        ok, killing: BOOLEAN;
+        target, scratch: Buffers.BufRec;
+  BEGIN
+    Mini.Prompt("Kill buffer: ", n, ok, bufferCompleter);
+    IF ok THEN
+      IF n[0] = 0X THEN target := Buffers.Current()
+      ELSE target := Buffers.Find(n)
+      END;
+      IF target = NIL THEN
+        SetStatus("No such buffer")
+      ELSE
+        killing := TRUE;
+        IF target.buf.changed THEN
+          killing := Mini.Confirm("Buffer modified. Kill anyway? (y/n) ")
+        END;
+        IF killing THEN
+          IF target = Buffers.Current() THEN detachCurrent END;
+          Buffers.Kill(target);
+          IF Buffers.Count() = 0 THEN
+            CopyStr(scratchName, "*scratch*");
+            scratch := makeBuffer(scratchName);
+            Buffers.Add(scratch);
+            Buffers.SetCurrent(scratch)
+          END;
+          attachCurrent;
+          lastWasYank := FALSE; lastWasKill := FALSE;
+          SetStatus("Buffer killed")
+        ELSE
+          SetStatus("Kill cancelled")
+        END
+      END
+    ELSE
+      SetStatus("Kill cancelled")
+    END
+  END PromptKillBuffer;
+
+  (* Decimal int → string. Right-pads result with NUL. *)
+  PROCEDURE IntStr(n: INTEGER; VAR s: ARRAY OF CHAR);
+    VAR digits: ARRAY 16 OF CHAR; i, j: INTEGER; ch: CHAR;
+  BEGIN
+    IF n < 0 THEN n := -n END;
+    IF n = 0 THEN
+      s[0] := "0"; s[1] := 0X
+    ELSE
+      i := 0;
+      WHILE n > 0 DO
+        ch := CHR(ORD("0") + n MOD 10);
+        digits[i] := ch;
+        n := n DIV 10;
+        INC(i)
+      END;
+      j := 0;
+      WHILE i > 0 DO
+        DEC(i);
+        s[j] := digits[i];
+        INC(j)
+      END;
+      s[j] := 0X
+    END
+  END IntStr;
+
+  (* Append a single char to a NUL-terminated string. *)
+  PROCEDURE AppendCh(VAR dst: ARRAY OF CHAR; ch: CHAR);
+    VAR i: INTEGER;
+  BEGIN
+    i := 0;
+    WHILE (i < LEN(dst) - 1) & (dst[i] # 0X) DO INC(i) END;
+    IF i < LEN(dst) - 1 THEN
+      dst[i] := ch; dst[i+1] := 0X
+    END
+  END AppendCh;
+
+  (* Build *buffers* with one line per registered buffer and switch to
+     it. Re-runs each time so the listing is always current. *)
+  PROCEDURE ListBuffers;
+    VAR br, listBr: Buffers.BufRec;
+        i, n, k: INTEGER;
+        line: ARRAY 128 OF CHAR;
+        sizeStr: ARRAY 16 OF CHAR;
+        listName: ARRAY NameLen OF CHAR;
+        ch: CHAR;
+  BEGIN
+    CopyStr(listName, "*buffers*");
+    listBr := Buffers.Find(listName);
+    IF listBr = NIL THEN
+      listBr := makeBuffer(listName);
+      Buffers.Add(listBr)
+    END;
+
+    (* Wipe and repopulate. *)
+    Buffer.Delete(listBr.buf, 0, listBr.buf.len);
+    Lines.Invalidate(listBr.lines);
+    n := 0;
+    i := 0;
+    WHILE i < Buffers.Count() DO
+      br := Buffers.At(i);
+      (* Format: "  <size>  <name><dirty>" *)
+      CopyStr(line, "  ");
+      IntStr(br.buf.len, sizeStr);
+      AppendStr(line, sizeStr);
+      AppendStr(line, "  ");
+      AppendStr(line, br.name);
+      IF br.buf.changed THEN AppendStr(line, " *") END;
+      k := 0;
+      WHILE (k < LEN(line)) & (line[k] # 0X) DO
+        ch := line[k];
+        Buffer.Insert(listBr.buf, n, ch);
+        INC(n); INC(k)
+      END;
+      Buffer.Insert(listBr.buf, n, 0AX);    (* terminate the row *)
+      INC(n);
+      INC(i)
+    END;
+    Lines.Invalidate(listBr.lines);
+    listBr.buf.changed := FALSE;            (* listing is not user-modified *)
+    listBr.cur := 0; listBr.top := 0;
+
+    switchTo(listBr);
+    SetStatus("Buffer list")
+  END ListBuffers;
+
   PROCEDURE PromptOpen;
   (* Open creates a new buffer (or switches to one already visiting
      the file). Current buffer's unsaved changes are preserved — they
@@ -970,6 +1096,10 @@ MODULE Oed;
       PromptOpen
     ELSIF k = ORD("b") THEN
       PromptSwitchBuffer
+    ELSIF k = ORD("k") THEN
+      PromptKillBuffer
+    ELSIF k = TUI.KeyCtrlB THEN
+      ListBuffers
     ELSE
       SetStatus("Command cancelled")
     END;

@@ -99,6 +99,27 @@ MODULE Buffers;
     IF i < nbuf THEN cur := i END
   END SetCurrent;
 
+  PROCEDURE Kill*(b: BufRec);
+  (* Remove b from the registry. If b was the current buffer, the new
+     current becomes whichever entry now occupies its old slot, or
+     the last entry if the killed one was last, or none (-1) if the
+     registry is now empty. *)
+    VAR i, j: INTEGER;
+  BEGIN
+    i := 0;
+    WHILE (i < nbuf) & (list[i] # b) DO INC(i) END;
+    IF i < nbuf THEN
+      j := i + 1;
+      WHILE j < nbuf DO list[j-1] := list[j]; INC(j) END;
+      DEC(nbuf);
+      list[nbuf] := NIL;
+      IF nbuf = 0 THEN cur := -1
+      ELSIF cur > i THEN DEC(cur)
+      ELSIF (cur = i) & (cur >= nbuf) THEN cur := nbuf - 1
+      END
+    END
+  END Kill;
+
   PROCEDURE Count*(): INTEGER;
   BEGIN RETURN nbuf
   END Count;

@@ -118,6 +118,8 @@ The Ctrl-X prefix gates buffer- and file-level commands.
 | `C-x C-w` | save as (always prompts) |
 | `C-x C-f` | open file in a new buffer (or switch to existing buffer for that file) |
 | `C-x b`   | switch to a named buffer; Tab completes against the buffer list |
+| `C-x k`   | kill a buffer (default current; confirms if dirty) |
+| `C-x C-b` | list buffers in a `*buffers*` view |
 | `C-x C-c` | quit (warns if any buffer has unsaved changes, not just the current one) |
 
 ## Architecture
