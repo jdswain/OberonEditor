@@ -18,7 +18,7 @@ RUNTIMES := $(SRC)/TUI_rt.c
 
 .PHONY: all run test check clean
 
-all: $(BIN)/oed $(BIN)/tuitest $(BIN)/buftest $(BIN)/linestest
+all: $(BIN)/oed $(BIN)/tuitest $(BIN)/buftest $(BIN)/linestest $(BIN)/csvtest $(BIN)/directivetest
 
 $(BIN):
 	mkdir -p $(BIN)
@@ -35,14 +35,20 @@ $(BIN)/buftest: $(SRC)/BufferTest.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Ou
 $(BIN)/linestest: $(SRC)/LinesTest.Mod $(SRC)/Lines.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
 	$(OC) -o $@ $(SRC)/LinesTest.Mod $(SRC)/Out_rt.c
 
+$(BIN)/csvtest: $(SRC)/CsvTest.Mod $(SRC)/Csv.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
+	$(OC) -o $@ $(SRC)/CsvTest.Mod $(SRC)/Out_rt.c
+
+$(BIN)/directivetest: $(SRC)/DirectiveTest.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
+	$(OC) -o $@ $(SRC)/DirectiveTest.Mod $(SRC)/Out_rt.c
+
 run: $(BIN)/oed
 	$(BIN)/oed
 
 test: $(BIN)/tuitest
 	$(BIN)/tuitest
 
-check: $(BIN)/buftest $(BIN)/linestest
-	$(BIN)/buftest && $(BIN)/linestest
+check: $(BIN)/buftest $(BIN)/linestest $(BIN)/csvtest $(BIN)/directivetest
+	$(BIN)/buftest && $(BIN)/linestest && $(BIN)/csvtest && $(BIN)/directivetest
 
 clean:
 	rm -f $(SRC)/*.o $(SRC)/*.ll $(SRC)/*.smb $(SRC)/*.deps $(SRC)/*.tmp
