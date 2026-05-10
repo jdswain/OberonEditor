@@ -12,7 +12,7 @@ MODULE Doc;
    that wires Buffer + Lines together. Persistence remains the
    province of Buffer.Save / Buffer.Load. *)
 
-  IMPORT Buffer, Lines;
+  IMPORT Buffer, Lines, Schema;
 
   CONST
     NameLen* = 128;
@@ -20,9 +20,10 @@ MODULE Doc;
   TYPE
     Doc* = POINTER TO DocDesc;
     DocDesc* = RECORD
-      name*:  ARRAY NameLen OF CHAR;     (* canonical path or synthetic name *)
-      buf*:   Buffer.Buffer;
-      lines*: Lines.Lines
+      name*:   ARRAY NameLen OF CHAR;    (* canonical path or synthetic name *)
+      buf*:    Buffer.Buffer;
+      lines*:  Lines.Lines;
+      schema*: Schema.Schema             (* NIL except when populated for kCollection *)
     END;
 
   PROCEDURE New*(name: ARRAY OF CHAR): Doc;
@@ -36,6 +37,7 @@ MODULE Doc;
     d.name[i] := 0X;
     d.buf := Buffer.New();
     d.lines := Lines.New(d.buf);
+    d.schema := NIL;
     RETURN d
   END New;
 

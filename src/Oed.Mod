@@ -5,7 +5,7 @@ MODULE Oed;
    versus presentation — lives in Doc.Mod and Viewers.Mod, the first
    step of the data-layer plan in doc/DataDDR.md. *)
 
-  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Doc, Viewers, Project;
+  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Schema, Doc, Viewers, Project;
 
   CONST
     ModeEntry   = 0;
@@ -477,6 +477,18 @@ MODULE Oed;
 
   (* ---------------- file commands ---------------- *)
 
+  (* For collection-kind viewers, parse the @column header into the
+     Doc's schema slot. Called after Buffer.Load on the open paths
+     and after a save-as that changes the kind. No-op for other
+     kinds; the schema goes stale on edit (acceptable for v1). *)
+  PROCEDURE refreshSchema(v: Viewers.Viewer);
+  BEGIN
+    IF (v # NIL) & (v.kind = Viewers.KCollection) THEN
+      IF v.doc.schema = NIL THEN v.doc.schema := Schema.New() END;
+      Schema.Parse(v.doc.buf, v.doc.schema)
+    END
+  END refreshSchema;
+
   (* Save without any checks. Used after the directory pre-flight
      in DoSave has confirmed the target dir exists (or just created
      it on the user's behalf). *)
@@ -528,7 +540,8 @@ MODULE Oed;
       IF v # NIL THEN
         CopyStr(v.doc.name, name);     (* canonical Doc name *)
         Project.Logical(name, v.label);(* refresh display label *)
-        v.kind := Viewers.KindOf(name) (* extension may have changed *)
+        v.kind := Viewers.KindOf(name);(* extension may have changed *)
+        refreshSchema(v)               (* re-parse if kind became kCollection *)
       END;
       DoSave
     ELSE
@@ -824,6 +837,7 @@ MODULE Oed;
         target := makeViewer(fname);
         Buffer.Load(target.doc.buf, fname, res);
         Lines.Invalidate(target.doc.lines);
+        refreshSchema(target);
         Viewers.Add(target);
         IF res = Buffer.Ok THEN SetStatus("Opened")
         ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
@@ -925,8 +939,9 @@ MODULE Oed;
   END DrawBufferAndLocateCursor;
 
   PROCEDURE DrawStatusBar;
-    VAR line, col, dummy: INTEGER;
+    VAR line, col, dummy, i: INTEGER;
         displayName: ARRAY NameLen OF CHAR;
+        v: Viewers.Viewer;
   BEGIN
     TUI.MoveTo(0, TUI.Rows - 2);
     TUI.SetAttr(TUI.AttrReverse);
@@ -942,6 +957,19 @@ MODULE Oed;
     Lines.Locate(lines, cur, line, col);
     TUI.WriteStr("L:"); TUI.WriteInt(line + 1);
     TUI.WriteStr(" C:"); TUI.WriteInt(col + 1);
+    v := Viewers.Current();
+    IF (v # NIL) & (v.kind = Viewers.KCollection) & (v.doc.schema # NIL) THEN
+      TUI.WriteStr("  [");
+      TUI.WriteInt(v.doc.schema.ncol); TUI.WriteStr(" cols");
+      i := 0;
+      WHILE (i < v.doc.schema.ncol) & (i < 4) DO
+        IF i = 0 THEN TUI.WriteStr(": ") ELSE TUI.WriteStr(", ") END;
+        TUI.WriteStr(v.doc.schema.cols[i].name);
+        INC(i)
+      END;
+      IF v.doc.schema.ncol > 4 THEN TUI.WriteStr(", ...") END;
+      TUI.WriteStr("]")
+    END;
     dummy := 0;
     WHILE dummy < TUI.Cols DO TUI.Write(" "); INC(dummy) END;
     TUI.SetAttr(TUI.AttrNormal)
@@ -1200,6 +1228,7 @@ MODULE Oed;
           target := makeViewer(fname);
           Buffer.Load(target.doc.buf, fname, res);
           Lines.Invalidate(target.doc.lines);
+          refreshSchema(target);
           Viewers.Add(target);
           IF res = Buffer.Ok THEN SetStatus("Opened")
           ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")

@@ -247,9 +247,8 @@ MODULE Directive;
             IF s.ok THEN
               IF atEnd(s) OR (s.ch # ")") THEN
                 s.ok := FALSE
-              ELSE
-                step(s)
               END
+              (* No step after ')': s.pos already points one past it. *)
             END
           END
         END
