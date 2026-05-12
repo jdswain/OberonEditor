@@ -5,7 +5,8 @@ MODULE Oed;
    versus presentation — lives in Doc.Mod and Viewers.Mod, the first
    step of the data-layer plan in doc/DataDDR.md. *)
 
-  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Schema, Doc, Viewers, Project;
+  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Schema, Doc, Viewers, Project,
+         Collection, TableView;
 
   CONST
     ModeEntry   = 0;
@@ -21,8 +22,10 @@ MODULE Oed;
   VAR
     buf:     Buffer.Buffer;
     lines:   Lines.Lines;
-    cur:     INTEGER;          (* cursor as buffer position *)
-    top:     INTEGER;          (* buffer pos of first visible line's start *)
+    cur:     INTEGER;          (* text: cursor pos; table: row index *)
+    top:     INTEGER;          (* text: top-line pos; table: top-row index *)
+    curCol:  INTEGER;          (* table: column index; ignored for text *)
+    dataDoc: Doc.Doc;          (* table: backing data Doc; else NIL *)
     name:    ARRAY NameLen OF CHAR;
     mode:    INTEGER;
     running: BOOLEAN;
@@ -462,32 +465,84 @@ MODULE Oed;
   (* ---------------- scrolling ---------------- *)
 
   PROCEDURE ScrollToCursor;
-    VAR curLine, curCol, topLine, topCol, viewportRows: INTEGER;
+    VAR curLine, lineCol, topLine, topCol, viewportRows, dataRows: INTEGER;
+        v: Viewers.Viewer;
   BEGIN
     viewportRows := TUI.Rows - 2;
     IF viewportRows < 1 THEN viewportRows := 1 END;
-    Lines.Locate(lines, cur, curLine, curCol);
-    Lines.Locate(lines, top, topLine, topCol);
-    IF curLine < topLine THEN
-      top := Lines.LineStart(lines, curLine)
-    ELSIF curLine >= topLine + viewportRows THEN
-      top := Lines.LineStart(lines, curLine - viewportRows + 1)
+    v := Viewers.Current();
+    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+      dataRows := viewportRows - 1;            (* minus the header row *)
+      IF dataRows < 1 THEN dataRows := 1 END;
+      IF cur < top THEN top := cur
+      ELSIF cur >= top + dataRows THEN top := cur - dataRows + 1
+      END;
+      IF top < 0 THEN top := 0 END
+    ELSE
+      Lines.Locate(lines, cur, curLine, lineCol);
+      Lines.Locate(lines, top, topLine, topCol);
+      IF curLine < topLine THEN
+        top := Lines.LineStart(lines, curLine)
+      ELSIF curLine >= topLine + viewportRows THEN
+        top := Lines.LineStart(lines, curLine - viewportRows + 1)
+      END
     END
   END ScrollToCursor;
 
   (* ---------------- file commands ---------------- *)
 
-  (* For collection-kind viewers, parse the @column header into the
-     Doc's schema slot. Called after Buffer.Load on the open paths
-     and after a save-as that changes the kind. No-op for other
-     kinds; the schema goes stale on edit (acceptable for v1). *)
+  (* Parse the @column header for kinds that need a Schema. Both
+     kCollection (the schema OF the data) and kTableView (the
+     projection columns) populate doc.schema the same way. The
+     schema goes stale on edit (acceptable for v1). *)
   PROCEDURE refreshSchema(v: Viewers.Viewer);
   BEGIN
-    IF (v # NIL) & (v.kind = Viewers.KCollection) THEN
-      IF v.doc.schema = NIL THEN v.doc.schema := Schema.New() END;
-      Schema.Parse(v.doc.buf, v.doc.schema)
+    IF v # NIL THEN
+      IF (v.kind = Viewers.KCollection) OR (v.kind = Viewers.KTableView) THEN
+        IF v.doc.schema = NIL THEN v.doc.schema := Schema.New() END;
+        Schema.Parse(v.doc.buf, v.doc.schema)
+      END
     END
   END refreshSchema;
+
+  (* For a kTableView, parse the @ref directive, resolve to a
+     physical .col path, and find or load a sibling kCollection
+     viewer for the data. Sets v.dataDoc to that viewer's Doc so the
+     Table renders against shared bytes (edits to either view show
+     in the other). *)
+  PROCEDURE loadTableData(v: Viewers.Viewer);
+    VAR refPath, physBase, physPath: ARRAY 256 OF CHAR;
+        sch: Schema.Schema;
+        data: Viewers.Viewer;
+        d: Doc.Doc;
+        res: INTEGER;
+        nm: ARRAY NameLen OF CHAR;
+  BEGIN
+    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+      sch := v.doc.schema;
+      IF sch = NIL THEN sch := Schema.New(); v.doc.schema := sch END;
+      TableView.Parse(v.doc.buf, sch, refPath);
+      IF refPath[0] # 0X THEN
+        Project.Resolve(refPath, physBase);
+        CopyStr(physPath, physBase);
+        AppendStr(physPath, ".col");
+        data := Viewers.FindByDocName(physPath);
+        IF data = NIL THEN
+          CopyStr(nm, physPath);
+          d := Doc.New(nm);
+          Buffer.Load(d.buf, physPath, res);
+          Lines.Invalidate(d.lines);
+          d.schema := Schema.New();
+          Schema.Parse(d.buf, d.schema);
+          (* Register a viewer so the data file is also browsable. *)
+          Project.Logical(physPath, nm);
+          data := Viewers.New(nm, d, Viewers.KCollection);
+          Viewers.Add(data)
+        END;
+        v.dataDoc := data.doc
+      END
+    END
+  END loadTableData;
 
   (* Save without any checks. Used after the directory pre-flight
      in DoSave has confirmed the target dir exists (or just created
@@ -567,11 +622,13 @@ MODULE Oed;
   BEGIN
     v := Viewers.Current();
     IF v # NIL THEN
-      buf   := v.doc.buf;
-      lines := v.doc.lines;
-      cur   := v.cur;
-      top   := v.top;
-      mark  := v.mark;
+      buf     := v.doc.buf;
+      lines   := v.doc.lines;
+      cur     := v.cur;
+      top     := v.top;
+      mark    := v.mark;
+      curCol  := v.curCol;
+      dataDoc := v.dataDoc;
       CopyStr(name, v.doc.name)
     END
   END attachCurrent;
@@ -584,9 +641,10 @@ MODULE Oed;
   BEGIN
     v := Viewers.Current();
     IF v # NIL THEN
-      v.cur  := cur;
-      v.top  := top;
-      v.mark := mark
+      v.cur    := cur;
+      v.top    := top;
+      v.mark   := mark;
+      v.curCol := curCol
     END
   END detachCurrent;
 
@@ -839,6 +897,7 @@ MODULE Oed;
         Lines.Invalidate(target.doc.lines);
         refreshSchema(target);
         Viewers.Add(target);
+        loadTableData(target);
         IF res = Buffer.Ok THEN SetStatus("Opened")
         ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
         ELSE SetStatus("Open failed")
@@ -954,10 +1013,15 @@ MODULE Oed;
     TUI.WriteStr(displayName);
     IF buf.changed THEN TUI.WriteStr(" *") END;
     TUI.WriteStr("    ");
-    Lines.Locate(lines, cur, line, col);
-    TUI.WriteStr("L:"); TUI.WriteInt(line + 1);
-    TUI.WriteStr(" C:"); TUI.WriteInt(col + 1);
     v := Viewers.Current();
+    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+      TUI.WriteStr("R:"); TUI.WriteInt(cur + 1);
+      TUI.WriteStr(" C:"); TUI.WriteInt(curCol + 1)
+    ELSE
+      Lines.Locate(lines, cur, line, col);
+      TUI.WriteStr("L:"); TUI.WriteInt(line + 1);
+      TUI.WriteStr(" C:"); TUI.WriteInt(col + 1)
+    END;
     IF (v # NIL) & (v.kind = Viewers.KCollection) & (v.doc.schema # NIL) THEN
       TUI.WriteStr("  [");
       TUI.WriteInt(v.doc.schema.ncol); TUI.WriteStr(" cols");
@@ -987,11 +1051,19 @@ MODULE Oed;
      leave it on the buffer (normal Refresh) or override the message
      line and re-place the cursor (interactive search). *)
   PROCEDURE RefreshFrame(VAR cursRow, cursCol: INTEGER);
+    VAR v: Viewers.Viewer;
   BEGIN
     TUI.Resize;
     ScrollToCursor;
     TUI.HideCursor;
-    DrawBufferAndLocateCursor(cursRow, cursCol);
+    v := Viewers.Current();
+    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+      TableView.Render(v.doc, v.dataDoc, top, cur, curCol, TUI.Rows - 2);
+      cursRow := cur - top + 1;                  (* +1 for header row *)
+      cursCol := TableView.ColumnX(v.doc.schema, curCol)
+    ELSE
+      DrawBufferAndLocateCursor(cursRow, cursCol)
+    END;
     DrawStatusBar
   END RefreshFrame;
 
@@ -1102,7 +1174,57 @@ MODULE Oed;
 
   (* ---------------- input ---------------- *)
 
-  PROCEDURE EntryKey(k: INTEGER);
+  (* Navigation for a kTableView. cur is the row index, top is the
+     top visible row, curCol the column. All operations clamp to
+     [0, nRows-1] and [0, nCols-1]. Read-only for now — printable
+     keys, edit keys, search, kill-ring etc. show an advisory. *)
+  PROCEDURE TableEntryKey(k: INTEGER);
+    VAR v: Viewers.Viewer;
+        nRows, nCols, viewportRows: INTEGER;
+  BEGIN
+    v := Viewers.Current();
+    IF v.doc.schema = NIL THEN nCols := 0
+    ELSE nCols := v.doc.schema.ncol
+    END;
+    nRows := TableView.RowCount(v.dataDoc);
+    viewportRows := TUI.Rows - 3;
+    IF viewportRows < 1 THEN viewportRows := 1 END;
+    IF k = TUI.KeyCtrlX THEN
+      mode := ModeCommand;
+      SetStatus("Ctrl-X: Ctrl-S save, Ctrl-W save-as, Ctrl-F open, Ctrl-C quit")
+    ELSIF (k = TUI.KeyArrowLeft) OR (k = TUI.KeyCtrlB) THEN
+      IF curCol > 0 THEN DEC(curCol) END; SetStatus("")
+    ELSIF (k = TUI.KeyArrowRight) OR (k = TUI.KeyCtrlF) THEN
+      IF curCol < nCols - 1 THEN INC(curCol) END; SetStatus("")
+    ELSIF (k = TUI.KeyArrowUp) OR (k = TUI.KeyCtrlP) THEN
+      IF cur > 0 THEN DEC(cur) END; SetStatus("")
+    ELSIF (k = TUI.KeyArrowDown) OR (k = TUI.KeyCtrlN) THEN
+      IF cur < nRows - 1 THEN INC(cur) END; SetStatus("")
+    ELSIF (k = TUI.KeyHome) OR (k = TUI.KeyCtrlA) THEN
+      curCol := 0; SetStatus("")
+    ELSIF (k = TUI.KeyEnd) OR (k = TUI.KeyCtrlE) THEN
+      IF nCols > 0 THEN curCol := nCols - 1 END; SetStatus("")
+    ELSIF k = TUI.KeyMetaLT THEN
+      cur := 0; top := 0; SetStatus("")
+    ELSIF k = TUI.KeyMetaGT THEN
+      IF nRows > 0 THEN cur := nRows - 1 END; SetStatus("")
+    ELSIF k = TUI.KeyPageUp THEN
+      cur := cur - viewportRows;
+      IF cur < 0 THEN cur := 0 END;
+      SetStatus("")
+    ELSIF k = TUI.KeyPageDown THEN
+      cur := cur + viewportRows;
+      IF cur >= nRows THEN cur := nRows - 1 END;
+      IF cur < 0 THEN cur := 0 END;
+      SetStatus("")
+    ELSIF k = TUI.KeyCtrlL THEN
+      SetStatus("")
+    ELSE
+      SetStatus("Read-only table — editing comes later")
+    END
+  END TableEntryKey;
+
+  PROCEDURE TextEntryKey(k: INTEGER);
     VAR ch: CHAR; isYankCmd, isKillCmd: BOOLEAN;
   BEGIN
     isYankCmd := (k = TUI.KeyCtrlY) OR (k = TUI.KeyMetaY);
@@ -1157,6 +1279,17 @@ MODULE Oed;
     END;
     IF ~isYankCmd THEN lastWasYank := FALSE END;
     IF ~isKillCmd THEN lastWasKill := FALSE END
+  END TextEntryKey;
+
+  PROCEDURE EntryKey(k: INTEGER);
+    VAR v: Viewers.Viewer;
+  BEGIN
+    v := Viewers.Current();
+    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+      TableEntryKey(k)
+    ELSE
+      TextEntryKey(k)
+    END
   END EntryKey;
 
   (* Any viewer in the registry whose Doc has unsaved changes? Used
@@ -1230,6 +1363,7 @@ MODULE Oed;
           Lines.Invalidate(target.doc.lines);
           refreshSchema(target);
           Viewers.Add(target);
+          loadTableData(target);
           IF res = Buffer.Ok THEN SetStatus("Opened")
           ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
           ELSE SetStatus("Open failed")

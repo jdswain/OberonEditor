@@ -10,6 +10,7 @@ MODULE Viewers;
 
   IMPORT Doc;
 
+
   CONST
     LabelLen = 96;        (* bigger than Doc.NameLen to allow suffixes
                              like "<text>" appended by raw-text view *)
@@ -27,12 +28,14 @@ MODULE Viewers;
   TYPE
     Viewer*    = POINTER TO ViewerDesc;
     ViewerDesc* = RECORD
-      label*: ARRAY LabelLen OF CHAR;
-      doc*:   Doc.Doc;
-      kind*:  INTEGER;
-      cur*:   INTEGER;
-      top*:   INTEGER;
-      mark*:  INTEGER
+      label*:   ARRAY LabelLen OF CHAR;
+      doc*:     Doc.Doc;
+      kind*:    INTEGER;
+      cur*:     INTEGER;        (* text: cursor byte position; table: row index *)
+      top*:     INTEGER;        (* text: top-line byte; table: top-row index *)
+      mark*:    INTEGER;        (* text: selection mark; -1 if unset *)
+      curCol*:  INTEGER;        (* table/form: column index; ignored for text *)
+      dataDoc*: Doc.Doc         (* table/form: backing data Doc via @ref; else NIL *)
     END;
 
   VAR
@@ -90,11 +93,13 @@ MODULE Viewers;
       v.label[i] := label[i]; INC(i)
     END;
     v.label[i] := 0X;
-    v.doc  := d;
-    v.kind := kind;
-    v.cur  := 0;
-    v.top  := 0;
-    v.mark := -1;
+    v.doc     := d;
+    v.kind    := kind;
+    v.cur     := 0;
+    v.top     := 0;
+    v.mark    := -1;
+    v.curCol  := 0;
+    v.dataDoc := NIL;
     RETURN v
   END New;
 
