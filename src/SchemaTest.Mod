@@ -146,6 +146,69 @@ MODULE SchemaTest;
     Expect(s.headerEnd = 0, "headerEnd at start")
   END TestNoHeader;
 
+  PROCEDURE TestLabelTypeWidth;
+  (* @column(name, "Label", integer, 6) — full form. *)
+    VAR b: Buffer.Buffer; s: Schema.Schema;
+  BEGIN
+    Out.WriteString("@column(name, Label, integer, 6):"); Out.Ln;
+    b := Buffer.New();
+    Append(b, "@column(age, ");
+    Buffer.Insert(b, b.len, 22X); Append(b, "Age"); Buffer.Insert(b, b.len, 22X);
+    Append(b, ", integer, 6)"); Buffer.Insert(b, b.len, 0AX);
+    s := Schema.New();
+    Schema.Parse(b, s);
+    Expect(s.ncol = 1, "one column");
+    Expect(StrEq(s.cols[0].name, "age"), "name = age");
+    Expect(StrEq(s.cols[0].label, "Age"), "label = Age");
+    Expect(StrEq(s.cols[0].type, "integer"), "type = integer");
+    Expect(s.cols[0].width = 6, "width = 6")
+  END TestLabelTypeWidth;
+
+  PROCEDURE TestDefaults;
+  (* Bare @column(name) → label=name, type=text, width=0. *)
+    VAR b: Buffer.Buffer; s: Schema.Schema;
+  BEGIN
+    Out.WriteString("@column(name) — defaults:"); Out.Ln;
+    b := Buffer.New();
+    Append(b, "@column(name)"); Buffer.Insert(b, b.len, 0AX);
+    s := Schema.New();
+    Schema.Parse(b, s);
+    Expect(StrEq(s.cols[0].name, "name"), "name");
+    Expect(StrEq(s.cols[0].label, "name"), "label defaults to name");
+    Expect(StrEq(s.cols[0].type, "text"), "type defaults to text");
+    Expect(s.cols[0].width = 0, "width defaults to 0")
+  END TestDefaults;
+
+  PROCEDURE TestFlexibleOrder;
+  (* @column(name, type) without label — type detected by kind. *)
+    VAR b: Buffer.Buffer; s: Schema.Schema;
+  BEGIN
+    Out.WriteString("@column(name, integer) — type via kind:"); Out.Ln;
+    b := Buffer.New();
+    Append(b, "@column(age, integer)"); Buffer.Insert(b, b.len, 0AX);
+    s := Schema.New();
+    Schema.Parse(b, s);
+    Expect(StrEq(s.cols[0].name, "age"), "name");
+    Expect(StrEq(s.cols[0].label, "age"), "label defaults to name");
+    Expect(StrEq(s.cols[0].type, "integer"), "type = integer")
+  END TestFlexibleOrder;
+
+  PROCEDURE TestFind;
+    VAR b: Buffer.Buffer; s: Schema.Schema;
+  BEGIN
+    Out.WriteString("Find by column name:"); Out.Ln;
+    b := Buffer.New();
+    Append(b, "@column(name)"); Buffer.Insert(b, b.len, 0AX);
+    Append(b, "@column(age)");  Buffer.Insert(b, b.len, 0AX);
+    Append(b, "@column(email)");Buffer.Insert(b, b.len, 0AX);
+    s := Schema.New();
+    Schema.Parse(b, s);
+    Expect(Schema.Find(s, "name")  = 0, "name → 0");
+    Expect(Schema.Find(s, "age")   = 1, "age → 1");
+    Expect(Schema.Find(s, "email") = 2, "email → 2");
+    Expect(Schema.Find(s, "nope")  = -1, "missing → -1")
+  END TestFind;
+
   PROCEDURE TestMalformedDirective;
   (* @column without parens — Directive.Parse rejects; we should skip
      the line gracefully and keep going. *)
@@ -171,6 +234,10 @@ MODULE SchemaTest;
     TestCommentsAndBlanks;
     TestOtherDirectives;
     TestNoHeader;
+    TestLabelTypeWidth;
+    TestDefaults;
+    TestFlexibleOrder;
+    TestFind;
     TestMalformedDirective;
     Out.Ln;
     Out.WriteString("results: ");

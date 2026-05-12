@@ -19,12 +19,16 @@ MODULE Schema;
   CONST
     MaxColumns* = 32;
     MaxName*    = 32;
+    MaxLabel*   = 64;
     NL          = 0AX;
     TAB         = 9X;
 
   TYPE
     Column* = RECORD
-      name*: ARRAY MaxName OF CHAR
+      name*:  ARRAY MaxName  OF CHAR;    (* identifier — `c[name]` access *)
+      label*: ARRAY MaxLabel OF CHAR;    (* display string, defaults to name *)
+      type*:  ARRAY MaxName  OF CHAR;    (* type name as written; "text" by default *)
+      width*: INTEGER                    (* render-width hint; 0 = unset *)
     END;
 
     Schema* = POINTER TO SchemaDesc;
@@ -78,6 +82,47 @@ MODULE Schema;
     RETURN a[i] = b[i]
   END strEq;
 
+  (* Fill column from a parsed @column directive. arg[0] is the name
+     (required ident). Remaining args are matched positionally by
+     kind: string → label; ident → type; int → width. This lets
+     users write any of:
+       @column(name)
+       @column(name, "Label")
+       @column(name, integer)
+       @column(name, "Label", integer, 6)
+     in any partial order. *)
+  PROCEDURE fillColumn(VAR col: Column; VAR d: Directive.Directive);
+    VAR i: INTEGER;
+  BEGIN
+    copyStr(col.name, d.args[0].str);
+    copyStr(col.label, d.args[0].str);   (* label defaults to name *)
+    copyStr(col.type, "text");           (* DDR default *)
+    col.width := 0;
+    i := 1;
+    WHILE i < d.narg DO
+      IF d.args[i].kind = Directive.AString THEN
+        copyStr(col.label, d.args[i].str)
+      ELSIF d.args[i].kind = Directive.AIdent THEN
+        copyStr(col.type, d.args[i].str)
+      ELSIF d.args[i].kind = Directive.AInt THEN
+        col.width := d.args[i].int
+      END;
+      INC(i)
+    END
+  END fillColumn;
+
+  PROCEDURE Find*(s: Schema; name: ARRAY OF CHAR): INTEGER;
+  (* Returns the index of the column with this name, or -1. *)
+    VAR i, found: INTEGER;
+  BEGIN
+    found := -1; i := 0;
+    WHILE (i < s.ncol) & (found < 0) DO
+      IF strEq(s.cols[i].name, name) THEN found := i END;
+      INC(i)
+    END;
+    RETURN found
+  END Find;
+
   PROCEDURE New*(): Schema;
     VAR s: Schema;
   BEGIN
@@ -119,7 +164,7 @@ MODULE Schema;
                 & (d.narg > 0)
                 & (d.args[0].kind = Directive.AIdent)
                 & (sch.ncol < MaxColumns) THEN
-              copyStr(sch.cols[sch.ncol].name, d.args[0].str);
+              fillColumn(sch.cols[sch.ncol], d);
               INC(sch.ncol)
             END;
             pos := skipToNL(b, ep)

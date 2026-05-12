@@ -18,7 +18,7 @@ RUNTIMES := $(SRC)/TUI_rt.c
 
 .PHONY: all run test check clean
 
-all: $(BIN)/oed $(BIN)/tuitest $(BIN)/buftest $(BIN)/linestest $(BIN)/csvtest $(BIN)/directivetest $(BIN)/schematest
+all: $(BIN)/oed $(BIN)/tuitest $(BIN)/buftest $(BIN)/linestest $(BIN)/csvtest $(BIN)/directivetest $(BIN)/schematest $(BIN)/colltest
 
 $(BIN):
 	mkdir -p $(BIN)
@@ -44,14 +44,17 @@ $(BIN)/directivetest: $(SRC)/DirectiveTest.Mod $(SRC)/Directive.Mod $(SRC)/Buffe
 $(BIN)/schematest: $(SRC)/SchemaTest.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
 	$(OC) -o $@ $(SRC)/SchemaTest.Mod $(SRC)/Out_rt.c
 
+$(BIN)/colltest: $(SRC)/CollectionTest.Mod $(SRC)/Collection.Mod $(SRC)/Csv.Mod $(SRC)/Lines.Mod $(SRC)/Doc.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
+	$(OC) -o $@ $(SRC)/CollectionTest.Mod $(SRC)/Out_rt.c
+
 run: $(BIN)/oed
 	$(BIN)/oed
 
 test: $(BIN)/tuitest
 	$(BIN)/tuitest
 
-check: $(BIN)/buftest $(BIN)/linestest $(BIN)/csvtest $(BIN)/directivetest $(BIN)/schematest
-	$(BIN)/buftest && $(BIN)/linestest && $(BIN)/csvtest && $(BIN)/directivetest && $(BIN)/schematest
+check: $(BIN)/buftest $(BIN)/linestest $(BIN)/csvtest $(BIN)/directivetest $(BIN)/schematest $(BIN)/colltest
+	$(BIN)/buftest && $(BIN)/linestest && $(BIN)/csvtest && $(BIN)/directivetest && $(BIN)/schematest && $(BIN)/colltest
 
 clean:
 	rm -f $(SRC)/*.o $(SRC)/*.ll $(SRC)/*.smb $(SRC)/*.deps $(SRC)/*.tmp

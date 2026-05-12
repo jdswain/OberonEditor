@@ -27,24 +27,36 @@ MODULE Csv;
 
   TYPE
     Reader* = RECORD
-      r:    Buffer.Reader;
-      ch:   CHAR;
-      eof*: BOOLEAN;        (* true once the underlying reader hit eot *)
-      eor*: BOOLEAN         (* true after the field that closed a row *)
+      r:         Buffer.Reader;
+      ch:        CHAR;
+      eof*:      BOOLEAN;        (* underlying reader has hit eot *)
+      eor*:      BOOLEAN;        (* the field just read closed a row *)
+      pos*:      INTEGER;        (* position of byte in ch, or buf.len if eof *)
+      fieldEnd*: INTEGER         (* byte position right after the most recently read
+                                    field's content, BEFORE the terminator was consumed.
+                                    Useful for in-place rewrites: the field's bytes are
+                                    [fieldStart .. fieldEnd). *)
     END;
 
   PROCEDURE step(VAR cr: Reader);
+  (* Advance one byte. cr.pos tracks the position of the byte
+     currently in cr.ch; once eof, cr.pos = buf.len. *)
   BEGIN
-    Buffer.Read(cr.r, cr.ch);
-    IF cr.r.eot THEN cr.eof := TRUE END
+    IF ~cr.eof THEN
+      Buffer.Read(cr.r, cr.ch);
+      IF cr.r.eot THEN cr.eof := TRUE END;
+      INC(cr.pos)
+    END
   END step;
 
   PROCEDURE OpenReader*(VAR cr: Reader; b: Buffer.Buffer; pos: INTEGER);
   BEGIN
     Buffer.OpenReader(cr.r, b, pos);
     cr.eof := FALSE; cr.eor := FALSE;
+    cr.pos := pos;
+    cr.fieldEnd := pos;
     Buffer.Read(cr.r, cr.ch);
-    IF cr.r.eot THEN cr.eof := TRUE END
+    IF cr.r.eot THEN cr.eof := TRUE; cr.pos := b.len END
   END OpenReader;
 
   PROCEDURE ReadField*(VAR cr: Reader; VAR field: ARRAY OF CHAR);
@@ -52,7 +64,8 @@ MODULE Csv;
   BEGIN
     i := 0; cr.eor := FALSE;
     IF cr.eof THEN
-      field[0] := 0X; cr.eor := TRUE
+      field[0] := 0X; cr.eor := TRUE;
+      cr.fieldEnd := cr.pos
     ELSIF cr.ch = QUOTE THEN
       step(cr);
       done := FALSE;
@@ -73,6 +86,7 @@ MODULE Csv;
         END
       END;
       field[i] := 0X;
+      cr.fieldEnd := cr.pos;            (* position of the terminator or eof *)
       IF cr.eof THEN cr.eor := TRUE
       ELSIF cr.ch = NL THEN cr.eor := TRUE; step(cr)
       ELSIF cr.ch = COMMA THEN step(cr)
@@ -84,6 +98,7 @@ MODULE Csv;
         step(cr)
       END;
       field[i] := 0X;
+      cr.fieldEnd := cr.pos;            (* position of the terminator or eof *)
       IF cr.eof THEN cr.eor := TRUE
       ELSIF cr.ch = NL THEN cr.eor := TRUE; step(cr)
       ELSE step(cr)                      (* COMMA: eor stays FALSE *)
