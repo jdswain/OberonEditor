@@ -18,7 +18,7 @@ MODULE SpreadsheetView;
    (`MaxDepth`) so cyclic refs terminate with an error rather than
    blowing the stack. *)
 
-  IMPORT Buffer, TUI, Expr, Directive, Schema, Csv, Doc, Collection;
+  IMPORT Buffer, Lines, TUI, Expr, Directive, Schema, Csv, Doc, Collection;
 
   CONST
     MaxCells*     = 256;
@@ -242,6 +242,105 @@ MODULE SpreadsheetView;
     Schema.Parse(b, sch);          (* mostly empty for .ssh *)
     findRef(b, refPath, cells)
   END Parse;
+
+  PROCEDURE findCellLine(b: Buffer.Buffer; col, row: INTEGER;
+                         VAR lineStart, lineEnd: INTEGER): BOOLEAN;
+  (* Locate the `@cell(coord, ...)` line for (col, row), if any.
+     lineStart points to the start of the line (including any
+     leading whitespace) and lineEnd to one past its trailing
+     newline, so the caller can splice over it. *)
+    VAR pos, ls, content, ep: INTEGER;
+        d: Directive.Directive;
+        ok, found: BOOLEAN;
+        ch: CHAR;
+        c2, r2: INTEGER;
+  BEGIN
+    found := FALSE; pos := 0;
+    WHILE (pos < b.len) & ~found DO
+      ls := pos;
+      content := firstNonWS(b, pos);
+      IF content >= b.len THEN pos := content
+      ELSE
+        ch := byteAt(b, content);
+        IF ch = "@" THEN
+          Directive.Parse(b, content, d, ok, ep);
+          IF ok & strEq(d.name, "cell") & (d.narg >= 1)
+              & (d.args[0].kind = Directive.AIdent)
+              & matchCoord(d.args[0].str, c2, r2)
+              & (c2 = col) & (r2 = row) THEN
+            lineStart := ls;
+            lineEnd := skipToNL(b, ep);
+            found := TRUE
+          ELSE
+            pos := skipToNL(b, ep)
+          END
+        ELSE
+          pos := skipToNL(b, content)
+        END
+      END
+    END;
+    RETURN found
+  END findCellLine;
+
+  PROCEDURE appendBytes(b: Buffer.Buffer; VAR pos: INTEGER; s: ARRAY OF CHAR);
+    VAR k: INTEGER;
+  BEGIN
+    k := 0;
+    WHILE (k < LEN(s)) & (s[k] # 0X) DO
+      Buffer.Insert(b, pos, s[k]); INC(pos); INC(k)
+    END
+  END appendBytes;
+
+  PROCEDURE writeCoord(b: Buffer.Buffer; VAR pos: INTEGER; col, row: INTEGER);
+    VAR rowStr: ARRAY 8 OF CHAR;
+  BEGIN
+    Buffer.Insert(b, pos, CHR(ORD("A") + col)); INC(pos);
+    intToStr(row + 1, rowStr);
+    appendBytes(b, pos, rowStr)
+  END writeCoord;
+
+  PROCEDURE SetFormula*(viewDoc: Doc.Doc; col, row: INTEGER;
+                        formula: ARRAY OF CHAR);
+  (* Add or replace `@cell(coord, formula="<formula>")` for the
+     given (col, row) in viewDoc.buf. `formula` should start with
+     `=` (the value as the user typed it). If an existing @cell
+     line for the coord exists it's replaced; otherwise a new line
+     is appended (preceded by a newline if the buffer doesn't end
+     with one). *)
+    VAR start, end, pos: INTEGER;
+  BEGIN
+    IF findCellLine(viewDoc.buf, col, row, start, end) THEN
+      Buffer.Delete(viewDoc.buf, start, end);
+      pos := start
+    ELSE
+      pos := viewDoc.buf.len;
+      IF (pos > 0) THEN
+        (* Ensure last line ended with a newline. *)
+        IF byteAt(viewDoc.buf, pos - 1) # NL THEN
+          Buffer.Insert(viewDoc.buf, pos, NL); INC(pos)
+        END
+      END
+    END;
+    appendBytes(viewDoc.buf, pos, "@cell(");
+    writeCoord(viewDoc.buf, pos, col, row);
+    appendBytes(viewDoc.buf, pos, ", formula=");
+    Buffer.Insert(viewDoc.buf, pos, 22X); INC(pos);
+    appendBytes(viewDoc.buf, pos, formula);
+    Buffer.Insert(viewDoc.buf, pos, 22X); INC(pos);
+    Buffer.Insert(viewDoc.buf, pos, ")"); INC(pos);
+    Buffer.Insert(viewDoc.buf, pos, NL); INC(pos);
+    Lines.Invalidate(viewDoc.lines)
+  END SetFormula;
+
+  PROCEDURE ClearCell*(viewDoc: Doc.Doc; col, row: INTEGER);
+  (* Remove any @cell override line for (col, row). No-op if none. *)
+    VAR start, end: INTEGER;
+  BEGIN
+    IF findCellLine(viewDoc.buf, col, row, start, end) THEN
+      Buffer.Delete(viewDoc.buf, start, end);
+      Lines.Invalidate(viewDoc.lines)
+    END
+  END ClearCell;
 
   (* ---------------- composition + formula eval ---------------- *)
 

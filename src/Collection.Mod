@@ -152,6 +152,50 @@ MODULE Collection;
     END
   END GetCell;
 
+  PROCEDURE lastByte(b: Buffer.Buffer): CHAR;
+    VAR r: Buffer.Reader; ch: CHAR;
+  BEGIN
+    IF b.len = 0 THEN ch := 0X
+    ELSE
+      Buffer.OpenReader(r, b, b.len - 1);
+      Buffer.Read(r, ch)
+    END;
+    RETURN ch
+  END lastByte;
+
+  PROCEDURE AppendEmptyRow*(c: Collection);
+  (* Append one empty row to the data zone: schema.ncol-1 commas
+     plus a trailing newline. Ensures the previous row ends with
+     a newline first. *)
+    VAR pos, i, ncols: INTEGER;
+  BEGIN
+    IF (c # NIL) & (c.schema # NIL) THEN
+      pos := c.doc.buf.len;
+      IF (pos > 0) & (lastByte(c.doc.buf) # 0AX) THEN
+        Buffer.Insert(c.doc.buf, pos, 0AX); INC(pos)
+      END;
+      ncols := c.schema.ncol;
+      IF ncols < 1 THEN ncols := 1 END;
+      i := 0;
+      WHILE i < ncols - 1 DO
+        Buffer.Insert(c.doc.buf, pos, ","); INC(pos); INC(i)
+      END;
+      Buffer.Insert(c.doc.buf, pos, 0AX); INC(pos);
+      Lines.Invalidate(c.doc.lines)
+    END
+  END AppendEmptyRow;
+
+  PROCEDURE EnsureRow*(c: Collection; row: INTEGER);
+  (* Extend the data zone with empty rows so that row index `row`
+     exists. No-op if row already exists. *)
+    VAR n: INTEGER;
+  BEGIN
+    n := Count(c);
+    WHILE n <= row DO
+      AppendEmptyRow(c); INC(n)
+    END
+  END EnsureRow;
+
   PROCEDURE SetCell*(c: Collection; rowStart: INTEGER;
                      col: INTEGER; val: ARRAY OF CHAR);
   (* Replace the col'th field of the row starting at rowStart with

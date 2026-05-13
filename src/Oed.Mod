@@ -1497,8 +1497,107 @@ MODULE Oed;
     END
   END FormEntryKey;
 
-  (* Read-only navigation across an A1 grid. cur = row, curCol =
-     column. Editing / =-prefix routing comes in the next step. *)
+  (* Build a string showing the literal user-facing value at
+     (curCol, cur) for use as the edit prompt's initial. For
+     spreadsheets that means: if an @cell override exists at this
+     coord, show its formula (= form); otherwise show the .col
+     cell value. *)
+  PROCEDURE currentSpreadsheetText(VAR txt: ARRAY OF CHAR);
+    VAR v: Viewers.Viewer;
+        coll: Collection.Collection;
+        rowStart: INTEGER;
+        cells: SpreadsheetView.CellList;
+        refPath: ARRAY 256 OF CHAR;
+        i: INTEGER;
+        found: BOOLEAN;
+  BEGIN
+    txt[0] := 0X;
+    v := Viewers.Current();
+    IF v # NIL THEN
+      cells.n := 0;
+      SpreadsheetView.Parse(v.doc.buf, v.doc.schema, refPath, cells);
+      found := FALSE; i := 0;
+      WHILE (i < cells.n) & ~found DO
+        IF (cells.cells[i].col = curCol) & (cells.cells[i].row = cur) THEN
+          CopyStr(txt, cells.cells[i].formula);
+          found := TRUE
+        END;
+        INC(i)
+      END;
+      IF ~found & (v.dataDoc # NIL) THEN
+        coll := Collection.Open(v.dataDoc);
+        rowStart := Collection.FindRow(coll, cur);
+        IF rowStart >= 0 THEN
+          Collection.GetCell(coll, rowStart, curCol, txt)
+        END
+      END
+    END
+  END currentSpreadsheetText;
+
+  (* Cell editing for kSpreadsheetView. Prompts pre-filled with the
+     current value (formula text if overridden, .col value
+     otherwise). Routing:
+       - new value starts with "=" → SpreadsheetView.SetFormula on
+         the .ssh.
+       - else if the cell had a formula override but the new value
+         is plain, drop the override and write a literal value to
+         the .col.
+       - else → Collection.SetCell on the .col, extending the data
+         with empty rows if needed.
+       - empty new value → clears the cell on whichever side it
+         currently lives. *)
+  PROCEDURE EditSpreadsheetCell;
+    VAR v: Viewers.Viewer;
+        coll: Collection.Collection;
+        rowStart, dataCols: INTEGER;
+        cur0, newVal: ARRAY 256 OF CHAR;
+        ok: BOOLEAN;
+        promptText: ARRAY 64 OF CHAR;
+        coord: ARRAY 8 OF CHAR;
+        rowStr: ARRAY 8 OF CHAR;
+  BEGIN
+    v := Viewers.Current();
+    IF (v = NIL) OR (v.kind # Viewers.KSpreadsheetView)
+        OR (v.dataDoc = NIL) OR (v.dataDoc.schema = NIL) THEN
+      SetStatus("Cannot edit here")
+    ELSE
+      dataCols := v.dataDoc.schema.ncol;
+      currentSpreadsheetText(cur0);
+      coord[0] := CHR(ORD("A") + curCol); coord[1] := 0X;
+      IntStr(cur + 1, rowStr);
+      CopyStr(promptText, "Edit ");
+      AppendStr(promptText, coord);
+      AppendStr(promptText, rowStr);
+      AppendStr(promptText, ": ");
+      Mini.PromptEdit(promptText, cur0, newVal, ok, NIL);
+      IF ok THEN
+        IF newVal[0] = "=" THEN
+          (* Formulas can live in any cell — no data-column restriction. *)
+          SpreadsheetView.SetFormula(v.doc, curCol, cur, newVal);
+          SetStatus("Formula stored")
+        ELSIF (curCol < 0) OR (curCol >= dataCols) THEN
+          SetStatus("Column out of data range (use = for formulas)")
+        ELSE
+          SpreadsheetView.ClearCell(v.doc, curCol, cur);
+          coll := Collection.Open(v.dataDoc);
+          Collection.EnsureRow(coll, cur);
+          rowStart := Collection.FindRow(coll, cur);
+          IF rowStart < 0 THEN
+            SetStatus("Failed to extend data")
+          ELSE
+            Collection.SetCell(coll, rowStart, curCol, newVal);
+            SetStatus("Value stored")
+          END
+        END
+      ELSE
+        SetStatus("Edit cancelled")
+      END
+    END
+  END EditSpreadsheetCell;
+
+  (* Navigation + editing across an A1 grid. cur = row, curCol =
+     column. Enter opens an in-place edit that routes by =-prefix
+     to either the .ssh (formula) or the .col (literal value). *)
   PROCEDURE SpreadsheetEntryKey(k: INTEGER);
     VAR v: Viewers.Viewer; nCols: INTEGER;
   BEGIN
@@ -1527,8 +1626,10 @@ MODULE Oed;
       cur := cur + 10; SetStatus("")
     ELSIF k = TUI.KeyCtrlL THEN
       SetStatus("")
+    ELSIF k = TUI.KeyEnter THEN
+      EditSpreadsheetCell
     ELSE
-      SetStatus("Read-only spreadsheet — cell edit coming in step 13d")
+      SetStatus("Press Enter to edit; =-prefix routes to .ssh")
     END
   END SpreadsheetEntryKey;
 
