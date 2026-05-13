@@ -5,7 +5,7 @@ MODULE Oed;
    versus presentation — lives in Doc.Mod and Viewers.Mod, the first
    step of the data-layer plan in doc/DataDDR.md. *)
 
-  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Schema, Doc, Viewers, Project,
+  IMPORT TUI, Buffer, Lines, Env, Mini, Files, Schema, Csv, Doc, Viewers, Project,
          Collection, TableView;
 
   CONST
@@ -471,7 +471,8 @@ MODULE Oed;
     viewportRows := TUI.Rows - 2;
     IF viewportRows < 1 THEN viewportRows := 1 END;
     v := Viewers.Current();
-    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+    IF (v # NIL)
+        & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
       dataRows := viewportRows - 1;            (* minus the header row *)
       IF dataRows < 1 THEN dataRows := 1 END;
       IF cur < top THEN top := cur
@@ -799,53 +800,99 @@ MODULE Oed;
     END
   END IntStr;
 
-  (* Build *buffers* with one line per registered viewer and switch
-     to it. Re-runs each time so the listing is always current. *)
-  PROCEDURE ListBuffers;
-    VAR v, listV: Viewers.Viewer;
-        i, n, k: INTEGER;
-        line: ARRAY 128 OF CHAR;
-        sizeStr: ARRAY 16 OF CHAR;
-        listName: ARRAY NameLen OF CHAR;
-        ch: CHAR;
+  (* Append literal bytes from s to b at pos, advancing pos. *)
+  PROCEDURE appendBytes(b: Buffer.Buffer; VAR pos: INTEGER; s: ARRAY OF CHAR);
+    VAR k: INTEGER;
   BEGIN
-    CopyStr(listName, "*buffers*");
-    listV := Viewers.Find(listName);
-    IF listV = NIL THEN
-      listV := makeViewer(listName);
-      Viewers.Add(listV)
-    END;
+    k := 0;
+    WHILE (k < LEN(s)) & (s[k] # 0X) DO
+      Buffer.Insert(b, pos, s[k]); INC(pos); INC(k)
+    END
+  END appendBytes;
 
-    (* Wipe and repopulate. *)
-    Buffer.Delete(listV.doc.buf, 0, listV.doc.buf.len);
-    Lines.Invalidate(listV.doc.lines);
-    n := 0;
+  PROCEDURE kindName(k: INTEGER; VAR s: ARRAY OF CHAR);
+  (* Short label for Viewer.kind, used in the *viewers* table. *)
+  BEGIN
+    IF    k = Viewers.KText            THEN CopyStr(s, "text")
+    ELSIF k = Viewers.KCollection      THEN CopyStr(s, "coll")
+    ELSIF k = Viewers.KTableView       THEN CopyStr(s, "table")
+    ELSIF k = Viewers.KSpreadsheetView THEN CopyStr(s, "sheet")
+    ELSIF k = Viewers.KFormView        THEN CopyStr(s, "form")
+    ELSIF k = Viewers.KViewerList      THEN CopyStr(s, "list")
+    ELSE                                    CopyStr(s, "?")
+    END
+  END kindName;
+
+  (* (Re)populate the *viewers* synthetic Doc with one CSV row per
+     registered Viewer, behind a small @column header that drives
+     the table layout. The Doc is owned by the *viewers* Viewer
+     (`listV` below); its bytes are regenerated on every Refresh
+     while *viewers* is current, so the listing always reflects the
+     registry's current state. *)
+  PROCEDURE rebuildViewersDoc(d: Doc.Doc);
+    VAR pos, i: INTEGER;
+        v: Viewers.Viewer;
+        sizeStr, kStr: ARRAY 16 OF CHAR;
+  BEGIN
+    Buffer.Delete(d.buf, 0, d.buf.len);
+    pos := 0;
+    appendBytes(d.buf, pos, "@column(label, 32)");
+    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
+    appendBytes(d.buf, pos, "@column(kind, 6)");
+    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
+    appendBytes(d.buf, pos, "@column(size, 6)");
+    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
+    appendBytes(d.buf, pos, "@column(dirty, 2)");
+    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
+
     i := 0;
     WHILE i < Viewers.Count() DO
       v := Viewers.At(i);
-      (* Format: "  <size>  <label><dirty>" *)
-      CopyStr(line, "  ");
+      Csv.WriteField(d.buf, pos, v.label); Csv.WriteSep(d.buf, pos);
+      kindName(v.kind, kStr);
+      Csv.WriteField(d.buf, pos, kStr);    Csv.WriteSep(d.buf, pos);
       IntStr(v.doc.buf.len, sizeStr);
-      AppendStr(line, sizeStr);
-      AppendStr(line, "  ");
-      AppendStr(line, v.label);
-      IF v.doc.buf.changed THEN AppendStr(line, " *") END;
-      k := 0;
-      WHILE (k < LEN(line)) & (line[k] # 0X) DO
-        ch := line[k];
-        Buffer.Insert(listV.doc.buf, n, ch);
-        INC(n); INC(k)
+      Csv.WriteField(d.buf, pos, sizeStr); Csv.WriteSep(d.buf, pos);
+      IF v.doc.buf.changed THEN Csv.WriteField(d.buf, pos, "*")
+      ELSE Csv.WriteField(d.buf, pos, "")
       END;
-      Buffer.Insert(listV.doc.buf, n, 0AX);   (* terminate the row *)
-      INC(n);
+      Csv.EndRow(d.buf, pos);
       INC(i)
     END;
-    Lines.Invalidate(listV.doc.lines);
-    listV.doc.buf.changed := FALSE;            (* listing is not user-modified *)
-    listV.cur := 0; listV.top := 0;
 
-    switchTo(listV);
-    SetStatus("Buffer list")
+    Lines.Invalidate(d.lines);
+    d.buf.changed := FALSE;
+    IF d.schema = NIL THEN d.schema := Schema.New() END;
+    Schema.Parse(d.buf, d.schema)
+  END rebuildViewersDoc;
+
+  PROCEDURE ensureViewersList(): Viewers.Viewer;
+  (* Find or create the *viewers* listing viewer; kind is forced to
+     KViewerList and dataDoc points at itself so TableView.Render
+     can walk the embedded CSV directly. *)
+    VAR v: Viewers.Viewer; nm: ARRAY NameLen OF CHAR;
+  BEGIN
+    CopyStr(nm, "*viewers*");
+    v := Viewers.Find(nm);
+    IF v = NIL THEN
+      v := makeViewer(nm);
+      v.kind := Viewers.KViewerList;
+      v.dataDoc := v.doc;
+      Viewers.Add(v)
+    END;
+    RETURN v
+  END ensureViewersList;
+
+  PROCEDURE ListBuffers;
+  (* C-x C-b — switch to *viewers*. The Doc is rebuilt here and
+     every subsequent Refresh while *viewers* is current. *)
+    VAR v: Viewers.Viewer;
+  BEGIN
+    v := ensureViewersList();
+    rebuildViewersDoc(v.doc);
+    v.cur := 0; v.top := 0; v.curCol := 0;
+    switchTo(v);
+    SetStatus("Viewer list — Enter to switch, k to kill")
   END ListBuffers;
 
   (* C-x s: save every dirty buffer that has a real filename. Skips
@@ -1012,7 +1059,8 @@ MODULE Oed;
     IF buf.changed THEN TUI.WriteStr(" *") END;
     TUI.WriteStr("    ");
     v := Viewers.Current();
-    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+    IF (v # NIL)
+        & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
       TUI.WriteStr("R:"); TUI.WriteInt(cur + 1);
       TUI.WriteStr(" C:"); TUI.WriteInt(curCol + 1)
     ELSE
@@ -1055,7 +1103,11 @@ MODULE Oed;
     ScrollToCursor;
     TUI.HideCursor;
     v := Viewers.Current();
-    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+    IF v # NIL THEN
+      IF v.kind = Viewers.KViewerList THEN rebuildViewersDoc(v.doc) END
+    END;
+    IF (v # NIL)
+        & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
       TableView.Render(v.doc, v.dataDoc, top, cur, curCol, TUI.Rows - 2);
       cursRow := cur - top + 1;                  (* +1 for header row *)
       cursCol := TableView.ColumnX(v.doc.schema, curCol)
@@ -1223,9 +1275,58 @@ MODULE Oed;
     END
   END EditCurrentCell;
 
+  (* The *viewers* listing assigns row N to Viewers.At(N). Enter on
+     a row switches to that viewer; k kills it. Both clamp via
+     Viewers.At which returns NIL out-of-range. *)
+  PROCEDURE SwitchToRowViewer;
+    VAR target: Viewers.Viewer;
+  BEGIN
+    target := Viewers.At(cur);
+    IF target = NIL THEN SetStatus("No such row")
+    ELSIF target = Viewers.Current() THEN SetStatus("Already current")
+    ELSE
+      switchTo(target);
+      SetStatus("Switched")
+    END
+  END SwitchToRowViewer;
+
+  PROCEDURE KillRowViewer;
+    VAR target: Viewers.Viewer;
+        killing: BOOLEAN;
+        scratchName: ARRAY NameLen OF CHAR;
+        scratch: Viewers.Viewer;
+  BEGIN
+    target := Viewers.At(cur);
+    IF target = NIL THEN SetStatus("No such row")
+    ELSE
+      killing := TRUE;
+      IF target.doc.buf.changed THEN
+        killing := Mini.Confirm("Buffer modified. Kill anyway? (y/n) ")
+      END;
+      IF killing THEN
+        IF target = Viewers.Current() THEN detachCurrent END;
+        Viewers.Kill(target);
+        IF Viewers.Count() = 0 THEN
+          CopyStr(scratchName, "*scratch*");
+          scratch := makeViewer(scratchName);
+          Viewers.Add(scratch);
+          Viewers.SetCurrent(scratch)
+        END;
+        attachCurrent;
+        IF cur > 0 THEN DEC(cur) END;
+        lastWasYank := FALSE; lastWasKill := FALSE;
+        SetStatus("Buffer killed")
+      ELSE
+        SetStatus("Kill cancelled")
+      END
+    END
+  END KillRowViewer;
+
   (* Navigation for a kTableView. cur is the row index, top is the
      top visible row, curCol the column. Read-only motion for now;
-     Enter opens an in-place edit (EditCurrentCell). *)
+     Enter opens an in-place edit (EditCurrentCell). For
+     KViewerList, Enter switches to the row's viewer and k kills
+     it. *)
   PROCEDURE TableEntryKey(k: INTEGER);
     VAR v: Viewers.Viewer;
         nRows, nCols, viewportRows: INTEGER;
@@ -1268,9 +1369,19 @@ MODULE Oed;
     ELSIF k = TUI.KeyCtrlL THEN
       SetStatus("")
     ELSIF k = TUI.KeyEnter THEN
-      EditCurrentCell
+      IF v.kind = Viewers.KViewerList THEN
+        SwitchToRowViewer
+      ELSE
+        EditCurrentCell
+      END
+    ELSIF (k = ORD("k")) & (v.kind = Viewers.KViewerList) THEN
+      KillRowViewer
     ELSE
-      SetStatus("Press Enter to edit")
+      IF v.kind = Viewers.KViewerList THEN
+        SetStatus("Enter switches to viewer, k kills it")
+      ELSE
+        SetStatus("Press Enter to edit")
+      END
     END
   END TableEntryKey;
 
@@ -1335,7 +1446,8 @@ MODULE Oed;
     VAR v: Viewers.Viewer;
   BEGIN
     v := Viewers.Current();
-    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+    IF (v # NIL)
+        & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
       TableEntryKey(k)
     ELSE
       TextEntryKey(k)
