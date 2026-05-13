@@ -3,16 +3,21 @@ MODULE Directive;
    first non-whitespace character is '@':
 
        directive  = '@' name '(' [ arg { ',' arg } ] ')'
-       arg        = literal | identifier | name '=' arg-value
-       arg-value  = literal | identifier              (v1 scope)
+       arg        = literal | identifier | path | name '=' arg-value
+       arg-value  = literal | identifier | path
        literal    = string-literal | int-literal
+       path       = '/' { pathchar }
+
+   Paths start with `/` and stop at whitespace, comma, or closing
+   paren; they capture logical references like `@ref(/Notes/Contact)`
+   that Project.Mod resolves to physical files.
 
    Full expression args (parenthesised expressions, nested directives)
    are reserved for later steps once Expr.Mod arrives. v1 captures
    enough to recognise @column / @filter / @prompt / @cell / @ref /
    @field / @link headers — every value is one of: string, identifier,
-   integer; every arg is either bare or the right-hand side of a
-   `name=value` binding.
+   integer, or path; every arg is either bare or the right-hand side
+   of a `name=value` binding.
 
    Strings are double-quoted; embedded `"` is escaped as `\"`,
    embedded `\` as `\\`. *)
@@ -23,6 +28,7 @@ MODULE Directive;
     AString*  = 0;
     AIdent*   = 1;
     AInt*     = 2;
+    APath*    = 3;          (* /-rooted or relative path token, see readPath *)
 
     MaxArgs* = 16;
     MaxName* = 32;
@@ -108,6 +114,25 @@ MODULE Directive;
     id[i] := 0X
   END readIdent;
 
+  PROCEDURE isPathCh(ch: CHAR): BOOLEAN;
+  (* Chars allowed inside an unquoted directive path: identifier
+     chars plus `/`, `.`, `-`. Stops at whitespace, `,`, `)`. *)
+  BEGIN
+    RETURN isAlpha(ch) OR isDigit(ch)
+        OR (ch = "/") OR (ch = ".") OR (ch = "-")
+  END isPathCh;
+
+  PROCEDURE readPath(VAR s: state; VAR p: ARRAY OF CHAR);
+    VAR i: INTEGER;
+  BEGIN
+    i := 0;
+    WHILE ~atEnd(s) & isPathCh(s.ch) DO
+      IF i < LEN(p) - 1 THEN p[i] := s.ch; INC(i) END;
+      step(s)
+    END;
+    p[i] := 0X
+  END readPath;
+
   PROCEDURE readInt(VAR s: state; VAR n: INTEGER);
   BEGIN
     n := 0;
@@ -156,6 +181,9 @@ MODULE Directive;
       a.kind := AString;
       step(s);
       readString(s, a.str)
+    ELSIF s.ch = "/" THEN
+      a.kind := APath;
+      readPath(s, a.str)
     ELSIF (s.ch = "-") OR isDigit(s.ch) THEN
       a.kind := AInt;
       neg := s.ch = "-";

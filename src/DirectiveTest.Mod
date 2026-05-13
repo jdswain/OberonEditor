@@ -138,6 +138,45 @@ MODULE DirectiveTest;
     Expect(d.args[3].int = 80, "3 = 80")
   END TestColumn;
 
+  PROCEDURE TestPath;
+  (* @ref(/Notes/Contact) — unquoted path argument. *)
+    VAR b: Buffer.Buffer; d: Directive.Directive; ok: BOOLEAN; ep: INTEGER;
+  BEGIN
+    Out.WriteString("@ref with unquoted path:"); Out.Ln;
+    b := Buffer.New(); Load(b, "@ref(/Notes/Contact)");
+    Directive.Parse(b, 0, d, ok, ep);
+    Expect(ok, "ok");
+    Expect(StrEq(d.name, "ref"), "name = ref");
+    Expect(d.narg = 1, "narg = 1");
+    Expect(d.args[0].kind = Directive.APath, "kind path");
+    Expect(StrEq(d.args[0].str, "/Notes/Contact"), "value = /Notes/Contact")
+  END TestPath;
+
+  PROCEDURE TestPathAndIdent;
+  (* @ref(/path, col) — path first, then a bare ident column name. *)
+    VAR b: Buffer.Buffer; d: Directive.Directive; ok: BOOLEAN; ep: INTEGER;
+  BEGIN
+    Out.WriteString("@ref(/path, col):"); Out.Ln;
+    b := Buffer.New(); Load(b, "@ref(/Lookups/Country, code)");
+    Directive.Parse(b, 0, d, ok, ep);
+    Expect(ok, "ok");
+    Expect(d.narg = 2, "narg = 2");
+    Expect(d.args[0].kind = Directive.APath, "0 path");
+    Expect(StrEq(d.args[0].str, "/Lookups/Country"), "0 = /Lookups/Country");
+    Expect(d.args[1].kind = Directive.AIdent, "1 ident");
+    Expect(StrEq(d.args[1].str, "code"), "1 = code")
+  END TestPathAndIdent;
+
+  PROCEDURE TestPathWithExtension;
+    VAR b: Buffer.Buffer; d: Directive.Directive; ok: BOOLEAN; ep: INTEGER;
+  BEGIN
+    Out.WriteString("path with .col extension:"); Out.Ln;
+    b := Buffer.New(); Load(b, "@ref(/Notes/Contact.col)");
+    Directive.Parse(b, 0, d, ok, ep);
+    Expect(ok, "ok");
+    Expect(StrEq(d.args[0].str, "/Notes/Contact.col"), "extension preserved")
+  END TestPathWithExtension;
+
   PROCEDURE TestEscapedQuote;
   (* @col("she said \"hi\"") *)
     VAR b: Buffer.Buffer; d: Directive.Directive; ok: BOOLEAN; ep: INTEGER;
@@ -214,6 +253,9 @@ MODULE DirectiveTest;
     TestBinding;
     TestColumn;
     TestEscapedQuote;
+    TestPath;
+    TestPathAndIdent;
+    TestPathWithExtension;
     TestWhitespace;
     TestErrorMissingParen;
     TestErrorNoAt;

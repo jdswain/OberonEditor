@@ -213,6 +213,21 @@ MODULE Project;
     END
   END Resolve;
 
+  (* Resolve to a collection (.col) file. If the logical path already
+     ends in ".col", uses it as-is; otherwise appends ".col". Lets
+     @ref(/Foo) and @ref(/Foo.col) both reach the same file. *)
+  PROCEDURE ResolveColl*(logical: ARRAY OF CHAR; VAR physical: ARRAY OF CHAR);
+    VAR n: INTEGER;
+  BEGIN
+    Resolve(logical, physical);
+    n := strLen(physical);
+    IF (n < 4)
+        OR (physical[n-4] # ".") OR (physical[n-3] # "c")
+        OR (physical[n-2] # "o") OR (physical[n-1] # "l") THEN
+      appendStr(physical, ".col")
+    END
+  END ResolveColl;
+
 BEGIN
   root[0] := 0X;
   rootLen := 0

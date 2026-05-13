@@ -511,7 +511,7 @@ MODULE Oed;
      Table renders against shared bytes (edits to either view show
      in the other). *)
   PROCEDURE loadTableData(v: Viewers.Viewer);
-    VAR refPath, physBase, physPath: ARRAY 256 OF CHAR;
+    VAR refPath, physPath: ARRAY 256 OF CHAR;
         sch: Schema.Schema;
         data: Viewers.Viewer;
         d: Doc.Doc;
@@ -523,9 +523,7 @@ MODULE Oed;
       IF sch = NIL THEN sch := Schema.New(); v.doc.schema := sch END;
       TableView.Parse(v.doc.buf, sch, refPath);
       IF refPath[0] # 0X THEN
-        Project.Resolve(refPath, physBase);
-        CopyStr(physPath, physBase);
-        AppendStr(physPath, ".col");
+        Project.ResolveColl(refPath, physPath);
         data := Viewers.FindByDocName(physPath);
         IF data = NIL THEN
           CopyStr(nm, physPath);

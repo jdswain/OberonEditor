@@ -7,10 +7,10 @@ MODULE TableView;
    Computed columns (`@column(c[age]*12, ...)`) are reserved for
    when Expr-in-Directive is wired in.
 
-   `@ref` paths must be quoted strings — `@ref("/Objects/Contact")`.
-   Project.Resolve maps the logical path to a physical base and a
-   ".col" suffix is appended. (Unquoted paths will be added when
-   Directive.Mod learns to lex paths — see migration step 10.)
+   `@ref` accepts either an unquoted path (`@ref(/Notes/Contact)`)
+   or a string literal (`@ref("/Notes/Contact")`). Project.Resolve
+   maps the logical path to a physical base; the caller appends the
+   .col extension (see Project.ResolveColl).
 
    Parsing (TableView.Parse) populates the .tbl Doc's schema with the
    projection columns and writes the @ref path into a separate out
@@ -100,7 +100,8 @@ MODULE TableView;
         IF ch = "@" THEN
           Directive.Parse(b, content, d, ok, ep);
           IF ok & strEq(d.name, "ref") & (d.narg > 0)
-              & (d.args[0].kind = Directive.AString) THEN
+              & ((d.args[0].kind = Directive.APath)
+                 OR (d.args[0].kind = Directive.AString)) THEN
             copyStr(refPath, d.args[0].str);
             found := TRUE
           END;
