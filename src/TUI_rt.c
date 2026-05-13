@@ -36,6 +36,8 @@
 #define KEY_META_E      295
 #define KEY_META_W      296
 #define KEY_META_Y      297
+#define KEY_META_N      298
+#define KEY_META_P      299
 
 extern int TUI__Rows;
 extern int TUI__Cols;
@@ -205,6 +207,8 @@ int TUI__ReadKey(void) {
         case 'e': return KEY_META_E;
         case 'w': return KEY_META_W;
         case 'y': return KEY_META_Y;
+        case 'n': return KEY_META_N;
+        case 'p': return KEY_META_P;
         }
         return 0x1b;
     }

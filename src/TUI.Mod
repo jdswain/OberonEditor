@@ -54,6 +54,8 @@ MODULE TUI;
     KeyMetaE*      = 295;       (* M-e  : forward sentence *)
     KeyMetaW*      = 296;       (* M-w  : copy region *)
     KeyMetaY*      = 297;       (* M-y  : yank-pop / kill-ring rotation *)
+    KeyMetaN*      = 298;       (* M-n  : next record (form view) *)
+    KeyMetaP*      = 299;       (* M-p  : previous record (form view) *)
 
     (* Display attributes. Bit-OR together for SetAttr. *)
     AttrNormal*  = 0;

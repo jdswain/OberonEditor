@@ -6,7 +6,7 @@ MODULE Oed;
    step of the data-layer plan in doc/DataDDR.md. *)
 
   IMPORT TUI, Buffer, Lines, Env, Mini, Files, Schema, Csv, Doc, Viewers, Project,
-         Collection, TableView;
+         Collection, TableView, FormView;
 
   CONST
     ModeEntry   = 0;
@@ -499,19 +499,21 @@ MODULE Oed;
   PROCEDURE refreshSchema(v: Viewers.Viewer);
   BEGIN
     IF v # NIL THEN
-      IF (v.kind = Viewers.KCollection) OR (v.kind = Viewers.KTableView) THEN
+      IF (v.kind = Viewers.KCollection) OR (v.kind = Viewers.KTableView)
+          OR (v.kind = Viewers.KFormView) THEN
         IF v.doc.schema = NIL THEN v.doc.schema := Schema.New() END;
         Schema.Parse(v.doc.buf, v.doc.schema)
       END
     END
   END refreshSchema;
 
-  (* For a kTableView, parse the @ref directive, resolve to a
-     physical .col path, and find or load a sibling kCollection
-     viewer for the data. Sets v.dataDoc to that viewer's Doc so the
-     Table renders against shared bytes (edits to either view show
-     in the other). *)
-  PROCEDURE loadTableData(v: Viewers.Viewer);
+  (* For a kTableView or kFormView, parse the view definition's
+     @ref directive, resolve to a physical .col path, and find or
+     load a sibling kCollection viewer for the data. v.dataDoc
+     ends up pointing at that viewer's Doc so the view renders
+     against shared bytes (edits to either view show in the
+     other). *)
+  PROCEDURE loadViewData(v: Viewers.Viewer);
     VAR refPath, physPath: ARRAY 256 OF CHAR;
         sch: Schema.Schema;
         data: Viewers.Viewer;
@@ -519,10 +521,15 @@ MODULE Oed;
         res: INTEGER;
         nm: ARRAY NameLen OF CHAR;
   BEGIN
-    IF (v # NIL) & (v.kind = Viewers.KTableView) THEN
+    IF (v # NIL)
+        & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KFormView)) THEN
       sch := v.doc.schema;
       IF sch = NIL THEN sch := Schema.New(); v.doc.schema := sch END;
-      TableView.Parse(v.doc.buf, sch, refPath);
+      IF v.kind = Viewers.KTableView THEN
+        TableView.Parse(v.doc.buf, sch, refPath)
+      ELSE
+        FormView.Parse(v.doc.buf, sch, refPath)
+      END;
       IF refPath[0] # 0X THEN
         Project.ResolveColl(refPath, physPath);
         data := Viewers.FindByDocName(physPath);
@@ -541,7 +548,7 @@ MODULE Oed;
         v.dataDoc := data.doc
       END
     END
-  END loadTableData;
+  END loadViewData;
 
   (* Save without any checks. Used after the directory pre-flight
      in DoSave has confirmed the target dir exists (or just created
@@ -942,7 +949,7 @@ MODULE Oed;
         Lines.Invalidate(target.doc.lines);
         refreshSchema(target);
         Viewers.Add(target);
-        loadTableData(target);
+        loadViewData(target);
         IF res = Buffer.Ok THEN SetStatus("Opened")
         ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
         ELSE SetStatus("Open failed")
@@ -1063,6 +1070,9 @@ MODULE Oed;
         & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
       TUI.WriteStr("R:"); TUI.WriteInt(cur + 1);
       TUI.WriteStr(" C:"); TUI.WriteInt(curCol + 1)
+    ELSIF (v # NIL) & (v.kind = Viewers.KFormView) THEN
+      TUI.WriteStr("Rec:"); TUI.WriteInt(top + 1);
+      TUI.WriteStr(" Fld:"); TUI.WriteInt(cur + 1)
     ELSE
       Lines.Locate(lines, cur, line, col);
       TUI.WriteStr("L:"); TUI.WriteInt(line + 1);
@@ -1111,6 +1121,9 @@ MODULE Oed;
       TableView.Render(v.doc, v.dataDoc, top, cur, curCol, TUI.Rows - 2);
       cursRow := cur - top + 1;                  (* +1 for header row *)
       cursCol := TableView.ColumnX(v.doc.schema, curCol)
+    ELSIF (v # NIL) & (v.kind = Viewers.KFormView) THEN
+      FormView.Render(v.doc, v.dataDoc, top, cur, TUI.Rows - 2,
+                      cursRow, cursCol)
     ELSE
       DrawBufferAndLocateCursor(cursRow, cursCol)
     END;
@@ -1385,6 +1398,90 @@ MODULE Oed;
     END
   END TableEntryKey;
 
+  (* Prompt for a new value for the current form field at the
+     current record, pre-filled with its existing value. On commit,
+     Collection.SetCell writes it back. *)
+  PROCEDURE EditCurrentField;
+    VAR v: Viewers.Viewer;
+        fl: FormView.Layout;
+        coll: Collection.Collection;
+        rowStart, dataCol: INTEGER;
+        cur0, newVal: ARRAY 256 OF CHAR;
+        ok: BOOLEAN;
+        promptText: ARRAY 64 OF CHAR;
+        name: ARRAY FormView.MaxFieldName OF CHAR;
+  BEGIN
+    v := Viewers.Current();
+    IF (v = NIL) OR (v.kind # Viewers.KFormView)
+        OR (v.dataDoc = NIL) OR (v.dataDoc.schema = NIL) THEN
+      SetStatus("Cannot edit here")
+    ELSE
+      FormView.CollectFields(v.doc, fl);
+      IF (cur < 0) OR (cur >= fl.n) THEN
+        SetStatus("No field selected")
+      ELSE
+        CopyStr(name, fl.fields[cur].name);
+        dataCol := Schema.Find(v.dataDoc.schema, name);
+        IF dataCol < 0 THEN
+          SetStatus("Field not in data schema")
+        ELSE
+          coll := Collection.Open(v.dataDoc);
+          rowStart := Collection.FindRow(coll, top);
+          IF rowStart < 0 THEN
+            SetStatus("Record out of range")
+          ELSE
+            Collection.GetCell(coll, rowStart, dataCol, cur0);
+            CopyStr(promptText, "Edit ");
+            AppendStr(promptText, name);
+            AppendStr(promptText, ": ");
+            Mini.PromptEdit(promptText, cur0, newVal, ok, NIL);
+            IF ok THEN
+              Collection.SetCell(coll, rowStart, dataCol, newVal);
+              SetStatus("Field updated")
+            ELSE
+              SetStatus("Edit cancelled")
+            END
+          END
+        END
+      END
+    END
+  END EditCurrentField;
+
+  (* Navigation for a kFormView. cur is the current field index,
+     top is the current record index. M-n / M-p step records, Tab
+     cycles fields, Enter opens an in-place edit. *)
+  PROCEDURE FormEntryKey(k: INTEGER);
+    VAR v: Viewers.Viewer;
+        nRecords, nFields: INTEGER;
+        fl: FormView.Layout;
+  BEGIN
+    v := Viewers.Current();
+    nRecords := FormView.RecordCount(v.dataDoc);
+    FormView.CollectFields(v.doc, fl);
+    nFields := fl.n;
+    IF k = TUI.KeyCtrlX THEN
+      mode := ModeCommand;
+      SetStatus("Ctrl-X: Ctrl-S save, Ctrl-W save-as, Ctrl-F open, Ctrl-C quit")
+    ELSIF (k = TUI.KeyMetaP) OR (k = TUI.KeyArrowUp) OR (k = TUI.KeyCtrlP) THEN
+      IF top > 0 THEN DEC(top) END; SetStatus("")
+    ELSIF (k = TUI.KeyMetaN) OR (k = TUI.KeyArrowDown) OR (k = TUI.KeyCtrlN) THEN
+      IF top < nRecords - 1 THEN INC(top) END; SetStatus("")
+    ELSIF k = TUI.KeyTab THEN
+      IF nFields > 0 THEN cur := (cur + 1) MOD nFields END;
+      SetStatus("")
+    ELSIF k = TUI.KeyMetaLT THEN
+      top := 0; SetStatus("")
+    ELSIF k = TUI.KeyMetaGT THEN
+      IF nRecords > 0 THEN top := nRecords - 1 END; SetStatus("")
+    ELSIF k = TUI.KeyEnter THEN
+      EditCurrentField
+    ELSIF k = TUI.KeyCtrlL THEN
+      SetStatus("")
+    ELSE
+      SetStatus("M-n/M-p record, Tab field, Enter edit")
+    END
+  END FormEntryKey;
+
   PROCEDURE TextEntryKey(k: INTEGER);
     VAR ch: CHAR; isYankCmd, isKillCmd: BOOLEAN;
   BEGIN
@@ -1449,6 +1546,8 @@ MODULE Oed;
     IF (v # NIL)
         & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
       TableEntryKey(k)
+    ELSIF (v # NIL) & (v.kind = Viewers.KFormView) THEN
+      FormEntryKey(k)
     ELSE
       TextEntryKey(k)
     END
@@ -1525,7 +1624,7 @@ MODULE Oed;
           Lines.Invalidate(target.doc.lines);
           refreshSchema(target);
           Viewers.Add(target);
-          loadTableData(target);
+          loadViewData(target);
           IF res = Buffer.Ok THEN SetStatus("Opened")
           ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
           ELSE SetStatus("Open failed")
