@@ -132,6 +132,26 @@ MODULE Collection;
     RETURN found
   END FindRow;
 
+  PROCEDURE GetCell*(c: Collection; rowStart: INTEGER;
+                     col: INTEGER; VAR val: ARRAY OF CHAR);
+  (* Reads the value of the col'th field in the row starting at
+     rowStart. Returns "" if the row has fewer than col+1 fields. *)
+    VAR cr: Csv.Reader;
+        scrap: ARRAY MaxField OF CHAR;
+        i: INTEGER; rowEnded: BOOLEAN;
+  BEGIN
+    Csv.OpenReader(cr, c.doc.buf, rowStart);
+    i := 0; rowEnded := FALSE;
+    WHILE (i < col) & ~rowEnded DO
+      Csv.ReadField(cr, scrap);
+      IF cr.eor OR cr.eof THEN rowEnded := TRUE END;
+      INC(i)
+    END;
+    IF rowEnded THEN val[0] := 0X
+    ELSE Csv.ReadField(cr, val)
+    END
+  END GetCell;
+
   PROCEDURE SetCell*(c: Collection; rowStart: INTEGER;
                      col: INTEGER; val: ARRAY OF CHAR);
   (* Replace the col'th field of the row starting at rowStart with

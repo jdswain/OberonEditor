@@ -135,6 +135,22 @@ MODULE CollectionTest;
     Expect(r3 = -1, "r3 out of range → -1")
   END TestFindRow;
 
+  PROCEDURE TestGetCell;
+    VAR d: Doc.Doc; c: Collection.Collection;
+        r0, r1: INTEGER; v: ARRAY 32 OF CHAR;
+  BEGIN
+    Out.WriteString("GetCell reads field values:"); Out.Ln;
+    d := makeDoc();
+    c := Collection.Open(d);
+    r0 := Collection.FindRow(c, 0);
+    Collection.GetCell(c, r0, 0, v); Expect(StrEq(v, "Alice"), "r0.0 Alice");
+    Collection.GetCell(c, r0, 1, v); Expect(StrEq(v, "30"), "r0.1 30");
+    Collection.GetCell(c, r0, 2, v); Expect(StrEq(v, "") & TRUE, "r0.2 out of range");
+    r1 := Collection.FindRow(c, 1);
+    Collection.GetCell(c, r1, 0, v); Expect(StrEq(v, "Bob"), "r1.0 Bob");
+    Collection.GetCell(c, r1, 1, v); Expect(StrEq(v, "25"), "r1.1 25")
+  END TestGetCell;
+
   PROCEDURE TestSetCellSameLen;
   (* Replace a field with a value of the same byte length. *)
     VAR d: Doc.Doc; c: Collection.Collection;
@@ -226,6 +242,7 @@ MODULE CollectionTest;
     TestFieldValues;
     TestCount;
     TestFindRow;
+    TestGetCell;
     TestSetCellSameLen;
     TestSetCellShorter;
     TestSetCellLonger;

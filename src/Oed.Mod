@@ -1174,10 +1174,60 @@ MODULE Oed;
 
   (* ---------------- input ---------------- *)
 
+  (* Prompt for a new value for the current (cur, curCol) cell, pre-
+     filled with the existing value, and on commit splice it into
+     the backing collection. The data Doc's b.changed flips so a
+     subsequent C-x s (or C-x C-s on the .col itself) persists. *)
+  PROCEDURE EditCurrentCell;
+    VAR v: Viewers.Viewer;
+        viewSch, dataSch: Schema.Schema;
+        coll: Collection.Collection;
+        rowStart, dataCol: INTEGER;
+        colName: ARRAY Schema.MaxName OF CHAR;
+        cur0, newVal: ARRAY 256 OF CHAR;
+        ok: BOOLEAN;
+        promptText: ARRAY 64 OF CHAR;
+  BEGIN
+    v := Viewers.Current();
+    IF (v = NIL) OR (v.kind # Viewers.KTableView)
+        OR (v.dataDoc = NIL) OR (v.doc.schema = NIL) THEN
+      SetStatus("Cannot edit here")
+    ELSE
+      viewSch := v.doc.schema;
+      dataSch := v.dataDoc.schema;
+      IF (curCol < 0) OR (curCol >= viewSch.ncol) THEN
+        SetStatus("No column selected")
+      ELSE
+        CopyStr(colName, viewSch.cols[curCol].name);
+        dataCol := Schema.Find(dataSch, colName);
+        IF dataCol < 0 THEN
+          SetStatus("Projection column not in data schema")
+        ELSE
+          coll := Collection.Open(v.dataDoc);
+          rowStart := Collection.FindRow(coll, cur);
+          IF rowStart < 0 THEN
+            SetStatus("Row out of range")
+          ELSE
+            Collection.GetCell(coll, rowStart, dataCol, cur0);
+            CopyStr(promptText, "Edit ");
+            AppendStr(promptText, viewSch.cols[curCol].label);
+            AppendStr(promptText, ": ");
+            Mini.PromptEdit(promptText, cur0, newVal, ok, NIL);
+            IF ok THEN
+              Collection.SetCell(coll, rowStart, dataCol, newVal);
+              SetStatus("Cell updated")
+            ELSE
+              SetStatus("Edit cancelled")
+            END
+          END
+        END
+      END
+    END
+  END EditCurrentCell;
+
   (* Navigation for a kTableView. cur is the row index, top is the
-     top visible row, curCol the column. All operations clamp to
-     [0, nRows-1] and [0, nCols-1]. Read-only for now — printable
-     keys, edit keys, search, kill-ring etc. show an advisory. *)
+     top visible row, curCol the column. Read-only motion for now;
+     Enter opens an in-place edit (EditCurrentCell). *)
   PROCEDURE TableEntryKey(k: INTEGER);
     VAR v: Viewers.Viewer;
         nRows, nCols, viewportRows: INTEGER;
@@ -1219,8 +1269,10 @@ MODULE Oed;
       SetStatus("")
     ELSIF k = TUI.KeyCtrlL THEN
       SetStatus("")
+    ELSIF k = TUI.KeyEnter THEN
+      EditCurrentCell
     ELSE
-      SetStatus("Read-only table — editing comes later")
+      SetStatus("Press Enter to edit")
     END
   END TableEntryKey;
 
