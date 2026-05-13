@@ -67,11 +67,14 @@ MODULE Expr;
       bool*: BOOLEAN
     END;
 
-    Resolver* = PROCEDURE(name: ARRAY OF CHAR; VAR v: Value);
+    Resolver*     = PROCEDURE(name: ARRAY OF CHAR; VAR v: Value);
+    CellResolver* = PROCEDURE(col, row: INTEGER; VAR v: Value);
 
     Scope* = RECORD
-      col*:    Resolver;
-      prompt*: Resolver
+      col*:         Resolver;
+      prompt*:      Resolver;
+      cell*:        CellResolver;   (* spreadsheet only; NIL in other scopes *)
+      spreadsheet*: BOOLEAN         (* TRUE → A1-like idents go through cell *)
     END;
 
     state = RECORD
@@ -417,6 +420,37 @@ MODULE Expr;
     END
   END parseFunc;
 
+  (* Does `name` match the spreadsheet A1 pattern [A-Z]+[0-9]+?
+     v1 supports single-letter columns (A..Z). Multi-letter
+     columns (AA, AB, ...) are deferred. *)
+  PROCEDURE matchesA1(name: ARRAY OF CHAR): BOOLEAN;
+    VAR i: INTEGER; ok: BOOLEAN;
+  BEGIN
+    ok := (name[0] >= "A") & (name[0] <= "Z");
+    IF ok THEN
+      i := 1;
+      ok := (name[i] >= "0") & (name[i] <= "9");
+      IF ok THEN
+        WHILE (name[i] >= "0") & (name[i] <= "9") DO INC(i) END;
+        ok := name[i] = 0X
+      END
+    END;
+    RETURN ok
+  END matchesA1;
+
+  PROCEDURE parseA1(name: ARRAY OF CHAR; VAR col, row: INTEGER);
+    VAR i: INTEGER;
+  BEGIN
+    col := ORD(name[0]) - ORD("A");
+    row := 0;
+    i := 1;
+    WHILE (name[i] >= "0") & (name[i] <= "9") DO
+      row := row * 10 + (ORD(name[i]) - ORD("0"));
+      INC(i)
+    END;
+    DEC(row)                      (* 1-based label → 0-based index *)
+  END parseA1;
+
   PROCEDURE parseColRef(VAR s: state; name: ARRAY OF CHAR; VAR v: Value);
   BEGIN
     IF s.scope.col = NIL THEN setError(v)
@@ -425,7 +459,7 @@ MODULE Expr;
   END parseColRef;
 
   PROCEDURE factor(VAR s: state; VAR v: Value);
-    VAR name: ARRAY MaxIdent OF CHAR;
+    VAR name: ARRAY MaxIdent OF CHAR; cellC, cellR: INTEGER;
   BEGIN
     IF s.tok = TInt THEN
       setInt(v, s.tokInt); next(s)
@@ -471,7 +505,16 @@ MODULE Expr;
           END
         END
       ELSE
-        parseColRef(s, name, v)
+        IF s.scope.spreadsheet & matchesA1(name) THEN
+          IF s.scope.cell = NIL THEN
+            setError(v)
+          ELSE
+            parseA1(name, cellC, cellR);
+            s.scope.cell(cellC, cellR, v)
+          END
+        ELSE
+          parseColRef(s, name, v)
+        END
       END
     ELSE
       setError(v); next(s)

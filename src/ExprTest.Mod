@@ -76,14 +76,14 @@ MODULE ExprTest;
   BEGIN
     b := Buffer.New();
     Append(b, expr);
-    sc.col := NIL; sc.prompt := NIL;
+    sc.col := NIL; sc.prompt := NIL; sc.cell := NIL; sc.spreadsheet := FALSE;
     Expr.Eval(b, 0, sc, v, ep)
   END evalNoScope;
 
   PROCEDURE evalWithScope(VAR b: Buffer.Buffer; VAR v: Expr.Value);
     VAR ep: INTEGER; sc: Expr.Scope;
   BEGIN
-    sc.col := testCol; sc.prompt := testPrompt;
+    sc.col := testCol; sc.prompt := testPrompt; sc.cell := NIL; sc.spreadsheet := FALSE;
     Expr.Eval(b, 0, sc, v, ep)
   END evalWithScope;
 
@@ -172,7 +172,7 @@ MODULE ExprTest;
     lbl := "if(false, 1, 2)";  expectInt("if(false, 1, 2)", 2, lbl);
     lbl := "not(true)";        expectBool("not(true)", FALSE, lbl);
 
-    sc.col := NIL; sc.prompt := NIL;
+    sc.col := NIL; sc.prompt := NIL; sc.cell := NIL; sc.spreadsheet := FALSE;
     b := Buffer.New();
     Append(b, "len("); AppendQ(b, "hello"); Append(b, ")");
     Expr.Eval(b, 0, sc, v, ep);
@@ -265,6 +265,49 @@ MODULE ExprTest;
     Expect((v.kind = Expr.VBool) & v.bool, lbl)
   END TestStringCompare;
 
+  (* Test scope's cell callback: A1 → 10, B1 → 20, C2 → 30. *)
+  PROCEDURE testCell(col, row: INTEGER; VAR v: Expr.Value);
+  BEGIN
+    IF    (col = 0) & (row = 0) THEN v.kind := Expr.VInt; v.int := 10
+    ELSIF (col = 1) & (row = 0) THEN v.kind := Expr.VInt; v.int := 20
+    ELSIF (col = 2) & (row = 1) THEN v.kind := Expr.VInt; v.int := 30
+    ELSE v.kind := Expr.VError
+    END
+  END testCell;
+
+  PROCEDURE TestCellRefs;
+    VAR b: Buffer.Buffer; v: Expr.Value;
+        ep: INTEGER; sc: Expr.Scope;
+        lbl: ARRAY 32 OF CHAR;
+  BEGIN
+    Out.WriteString("A1 cell refs (spreadsheet scope):"); Out.Ln;
+    sc.col := NIL; sc.prompt := NIL;
+    sc.cell := testCell; sc.spreadsheet := TRUE;
+
+    b := Buffer.New(); Append(b, "A1");
+    Expr.Eval(b, 0, sc, v, ep);
+    lbl := "A1 = 10";
+    Expect((v.kind = Expr.VInt) & (v.int = 10), lbl);
+
+    b := Buffer.New(); Append(b, "A1 + B1");
+    Expr.Eval(b, 0, sc, v, ep);
+    lbl := "A1 + B1 = 30";
+    Expect((v.kind = Expr.VInt) & (v.int = 30), lbl);
+
+    b := Buffer.New(); Append(b, "C2 * 2");
+    Expr.Eval(b, 0, sc, v, ep);
+    lbl := "C2 * 2 = 60";
+    Expect((v.kind = Expr.VInt) & (v.int = 60), lbl);
+
+    (* When the spreadsheet flag is off, A1-shaped idents fall back
+       to column-ref lookup (which errors with NIL col resolver). *)
+    sc.spreadsheet := FALSE;
+    b := Buffer.New(); Append(b, "A1");
+    Expr.Eval(b, 0, sc, v, ep);
+    lbl := "A1 off-mode → err";
+    Expect(v.kind = Expr.VError, lbl)
+  END TestCellRefs;
+
   PROCEDURE TestErrorPropagation;
     VAR lbl: ARRAY 32 OF CHAR;
   BEGIN
@@ -286,6 +329,7 @@ MODULE ExprTest;
     TestColRef;
     TestPromptRef;
     TestStringCompare;
+    TestCellRefs;
     TestErrorPropagation;
     Out.Ln;
     Out.WriteString("results: ");
