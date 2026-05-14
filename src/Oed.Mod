@@ -1595,9 +1595,51 @@ MODULE Oed;
     END
   END EditSpreadsheetCell;
 
+  (* Toggle a `format="bold"` binding on the @cell at (curCol, cur).
+     If the cell is currently bold, drop the format= binding;
+     otherwise set it. Round-trip preserves the formula= binding. *)
+  PROCEDURE ToggleCellBold;
+    VAR v: Viewers.Viewer;
+        cells: SpreadsheetView.CellList;
+        refPath: ARRAY 256 OF CHAR;
+        empty: ARRAY 8 OF CHAR;
+        bold: ARRAY 8 OF CHAR;
+        i: INTEGER; isBold: BOOLEAN;
+  BEGIN
+    v := Viewers.Current();
+    IF (v = NIL) OR (v.kind # Viewers.KSpreadsheetView) THEN
+      SetStatus("Cannot format here")
+    ELSE
+      cells.n := 0;
+      SpreadsheetView.Parse(v.doc.buf, v.doc.schema, refPath, cells);
+      isBold := FALSE; i := 0;
+      WHILE (i < cells.n) & ~isBold DO
+        IF (cells.cells[i].col = curCol) & (cells.cells[i].row = cur)
+            & (cells.cells[i].format[0] = "b")
+            & (cells.cells[i].format[1] = "o")
+            & (cells.cells[i].format[2] = "l")
+            & (cells.cells[i].format[3] = "d")
+            & (cells.cells[i].format[4] = 0X) THEN
+          isBold := TRUE
+        END;
+        INC(i)
+      END;
+      IF isBold THEN
+        empty[0] := 0X;
+        SpreadsheetView.SetFormat(v.doc, curCol, cur, empty);
+        SetStatus("Bold cleared")
+      ELSE
+        CopyStr(bold, "bold");
+        SpreadsheetView.SetFormat(v.doc, curCol, cur, bold);
+        SetStatus("Bold set")
+      END
+    END
+  END ToggleCellBold;
+
   (* Navigation + editing across an A1 grid. cur = row, curCol =
      column. Enter opens an in-place edit that routes by =-prefix
-     to either the .ssh (formula) or the .col (literal value). *)
+     to either the .ssh (formula) or the .col (literal value).
+     M-b toggles a `format="bold"` override on the current cell. *)
   PROCEDURE SpreadsheetEntryKey(k: INTEGER);
     VAR v: Viewers.Viewer; nCols: INTEGER;
   BEGIN
@@ -1628,8 +1670,10 @@ MODULE Oed;
       SetStatus("")
     ELSIF k = TUI.KeyEnter THEN
       EditSpreadsheetCell
+    ELSIF k = TUI.KeyMetaB THEN
+      ToggleCellBold
     ELSE
-      SetStatus("Press Enter to edit; =-prefix routes to .ssh")
+      SetStatus("Enter edit, M-b bold; =-prefix routes to .ssh")
     END
   END SpreadsheetEntryKey;
 

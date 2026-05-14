@@ -6,9 +6,10 @@
 # The compiler emits intermediate .o / .ll / .smb / .deps files alongside
 # the .Mod sources in src/; `make clean` removes them along with bin/.
 #
-# Env.Mod (argv access) lives in ../oc/oberon/ — the compiler's standard
-# runtime location — so any program that imports it picks it up
-# automatically without listing Env_rt.c as an extra.
+# Env.Mod (argv access) and Out.Mod (stdout test helper) live in
+# ../oc/oberon/ — the compiler's standard runtime location — so any
+# program that imports them picks them up automatically without
+# listing the corresponding _rt.c file as an extra.
 
 OC  ?= ../oc/bin/oc
 SRC := src
@@ -29,26 +30,26 @@ $(BIN)/oed: $(SRC)/Oed.Mod $(SRC)/TUI.Mod $(SRC)/Buffer.Mod $(SRC)/Lines.Mod $(S
 $(BIN)/tuitest: $(SRC)/TUITest.Mod $(SRC)/TUI.Mod $(SRC)/TUI_rt.c | $(BIN)
 	$(OC) -o $@ $(SRC)/TUITest.Mod $(RUNTIMES)
 
-$(BIN)/buftest: $(SRC)/BufferTest.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/BufferTest.Mod $(SRC)/Out_rt.c
+$(BIN)/buftest: $(SRC)/BufferTest.Mod $(SRC)/Buffer.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/BufferTest.Mod
 
-$(BIN)/linestest: $(SRC)/LinesTest.Mod $(SRC)/Lines.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/LinesTest.Mod $(SRC)/Out_rt.c
+$(BIN)/linestest: $(SRC)/LinesTest.Mod $(SRC)/Lines.Mod $(SRC)/Buffer.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/LinesTest.Mod
 
-$(BIN)/csvtest: $(SRC)/CsvTest.Mod $(SRC)/Csv.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/CsvTest.Mod $(SRC)/Out_rt.c
+$(BIN)/csvtest: $(SRC)/CsvTest.Mod $(SRC)/Csv.Mod $(SRC)/Buffer.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/CsvTest.Mod
 
-$(BIN)/directivetest: $(SRC)/DirectiveTest.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/DirectiveTest.Mod $(SRC)/Out_rt.c
+$(BIN)/directivetest: $(SRC)/DirectiveTest.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/DirectiveTest.Mod
 
-$(BIN)/schematest: $(SRC)/SchemaTest.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/SchemaTest.Mod $(SRC)/Out_rt.c
+$(BIN)/schematest: $(SRC)/SchemaTest.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/SchemaTest.Mod
 
-$(BIN)/colltest: $(SRC)/CollectionTest.Mod $(SRC)/Collection.Mod $(SRC)/Csv.Mod $(SRC)/Lines.Mod $(SRC)/Doc.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/CollectionTest.Mod $(SRC)/Out_rt.c
+$(BIN)/colltest: $(SRC)/CollectionTest.Mod $(SRC)/Collection.Mod $(SRC)/Csv.Mod $(SRC)/Lines.Mod $(SRC)/Doc.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Buffer.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/CollectionTest.Mod
 
-$(BIN)/exprtest: $(SRC)/ExprTest.Mod $(SRC)/Expr.Mod $(SRC)/Buffer.Mod $(SRC)/Out.Mod $(SRC)/Out_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/ExprTest.Mod $(SRC)/Out_rt.c
+$(BIN)/exprtest: $(SRC)/ExprTest.Mod $(SRC)/Expr.Mod $(SRC)/Buffer.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/ExprTest.Mod
 
 run: $(BIN)/oed
 	$(BIN)/oed

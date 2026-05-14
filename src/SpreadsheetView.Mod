@@ -23,6 +23,7 @@ MODULE SpreadsheetView;
   CONST
     MaxCells*     = 256;
     MaxFormula*   = 256;
+    MaxFormat*    = 32;
     MaxCellValue* = 256;
     MaxDepth      = 8;
 
@@ -34,7 +35,8 @@ MODULE SpreadsheetView;
   TYPE
     Cell* = RECORD
       col*, row*: INTEGER;
-      formula*: ARRAY MaxFormula OF CHAR
+      formula*: ARRAY MaxFormula OF CHAR;
+      format*:  ARRAY MaxFormat OF CHAR
     END;
 
     CellList* = RECORD
@@ -212,13 +214,19 @@ MODULE SpreadsheetView;
               cells.cells[cells.n].col := col;
               cells.cells[cells.n].row := row;
               cells.cells[cells.n].formula[0] := 0X;
-              (* Walk remaining args for `formula=...`. *)
+              cells.cells[cells.n].format[0] := 0X;
+              (* Walk remaining args for known bindings. Unknown
+                 keys are silently dropped in v1 (DDR's
+                 forwards-compat is a step-13e+ refinement). *)
               i := 1;
               WHILE i < d.narg DO
                 IF d.args[i].isBinding
-                    & strEq(d.args[i].key, "formula")
                     & (d.args[i].kind = Directive.AString) THEN
-                  copyStr(cells.cells[cells.n].formula, d.args[i].str)
+                  IF strEq(d.args[i].key, "formula") THEN
+                    copyStr(cells.cells[cells.n].formula, d.args[i].str)
+                  ELSIF strEq(d.args[i].key, "format") THEN
+                    copyStr(cells.cells[cells.n].format, d.args[i].str)
+                  END
                 END;
                 INC(i)
               END;
@@ -299,38 +307,126 @@ MODULE SpreadsheetView;
     appendBytes(b, pos, rowStr)
   END writeCoord;
 
+  PROCEDURE writeQuoted(b: Buffer.Buffer; VAR pos: INTEGER;
+                        key: ARRAY OF CHAR; val: ARRAY OF CHAR);
+  (* Append `, key="val"` at pos. *)
+  BEGIN
+    appendBytes(b, pos, ", ");
+    appendBytes(b, pos, key);
+    appendBytes(b, pos, "=");
+    Buffer.Insert(b, pos, 22X); INC(pos);
+    appendBytes(b, pos, val);
+    Buffer.Insert(b, pos, 22X); INC(pos)
+  END writeQuoted;
+
+  (* Write a full @cell(coord, formula="...", format="...") line at
+     pos, including a trailing newline. Bindings with empty values
+     are omitted. *)
+  PROCEDURE writeCellLine(b: Buffer.Buffer; VAR pos: INTEGER;
+                          col, row: INTEGER;
+                          formula, format: ARRAY OF CHAR);
+  BEGIN
+    appendBytes(b, pos, "@cell(");
+    writeCoord(b, pos, col, row);
+    IF formula[0] # 0X THEN writeQuoted(b, pos, "formula", formula) END;
+    IF format[0] # 0X THEN writeQuoted(b, pos, "format", format) END;
+    Buffer.Insert(b, pos, ")"); INC(pos);
+    Buffer.Insert(b, pos, NL); INC(pos)
+  END writeCellLine;
+
+  PROCEDURE ensureTrailingNL(b: Buffer.Buffer; VAR pos: INTEGER);
+  BEGIN
+    IF (pos > 0) & (byteAt(b, pos - 1) # NL) THEN
+      Buffer.Insert(b, pos, NL); INC(pos)
+    END
+  END ensureTrailingNL;
+
+  PROCEDURE existingBindings(b: Buffer.Buffer; col, row: INTEGER;
+                             VAR formula, format: ARRAY OF CHAR);
+  (* Pre-read an existing @cell's bindings so they can be preserved
+     when updating just one of them. Empty strings if no such line.
+     Implemented via a one-cell parse of the buffer. *)
+    VAR pos, content, ep, c2, r2, i: INTEGER;
+        d: Directive.Directive;
+        ok, found: BOOLEAN;
+        ch: CHAR;
+  BEGIN
+    formula[0] := 0X; format[0] := 0X;
+    found := FALSE; pos := 0;
+    WHILE (pos < b.len) & ~found DO
+      content := firstNonWS(b, pos);
+      IF content >= b.len THEN pos := content
+      ELSE
+        ch := byteAt(b, content);
+        IF ch = "@" THEN
+          Directive.Parse(b, content, d, ok, ep);
+          IF ok & strEq(d.name, "cell") & (d.narg >= 1)
+              & (d.args[0].kind = Directive.AIdent)
+              & matchCoord(d.args[0].str, c2, r2)
+              & (c2 = col) & (r2 = row) THEN
+            i := 1;
+            WHILE i < d.narg DO
+              IF d.args[i].isBinding
+                  & (d.args[i].kind = Directive.AString) THEN
+                IF strEq(d.args[i].key, "formula") THEN
+                  copyStr(formula, d.args[i].str)
+                ELSIF strEq(d.args[i].key, "format") THEN
+                  copyStr(format, d.args[i].str)
+                END
+              END;
+              INC(i)
+            END;
+            found := TRUE
+          ELSE
+            pos := skipToNL(b, ep)
+          END
+        ELSE
+          pos := skipToNL(b, content)
+        END
+      END
+    END
+  END existingBindings;
+
   PROCEDURE SetFormula*(viewDoc: Doc.Doc; col, row: INTEGER;
                         formula: ARRAY OF CHAR);
-  (* Add or replace `@cell(coord, formula="<formula>")` for the
-     given (col, row) in viewDoc.buf. `formula` should start with
-     `=` (the value as the user typed it). If an existing @cell
-     line for the coord exists it's replaced; otherwise a new line
-     is appended (preceded by a newline if the buffer doesn't end
-     with one). *)
+  (* Add or replace the formula= binding for (col, row). Any
+     existing format= binding is preserved. *)
     VAR start, end, pos: INTEGER;
+        oldFormula, oldFormat: ARRAY MaxFormat OF CHAR;
   BEGIN
+    existingBindings(viewDoc.buf, col, row, oldFormula, oldFormat);
     IF findCellLine(viewDoc.buf, col, row, start, end) THEN
       Buffer.Delete(viewDoc.buf, start, end);
       pos := start
     ELSE
       pos := viewDoc.buf.len;
-      IF (pos > 0) THEN
-        (* Ensure last line ended with a newline. *)
-        IF byteAt(viewDoc.buf, pos - 1) # NL THEN
-          Buffer.Insert(viewDoc.buf, pos, NL); INC(pos)
-        END
-      END
+      ensureTrailingNL(viewDoc.buf, pos)
     END;
-    appendBytes(viewDoc.buf, pos, "@cell(");
-    writeCoord(viewDoc.buf, pos, col, row);
-    appendBytes(viewDoc.buf, pos, ", formula=");
-    Buffer.Insert(viewDoc.buf, pos, 22X); INC(pos);
-    appendBytes(viewDoc.buf, pos, formula);
-    Buffer.Insert(viewDoc.buf, pos, 22X); INC(pos);
-    Buffer.Insert(viewDoc.buf, pos, ")"); INC(pos);
-    Buffer.Insert(viewDoc.buf, pos, NL); INC(pos);
+    writeCellLine(viewDoc.buf, pos, col, row, formula, oldFormat);
     Lines.Invalidate(viewDoc.lines)
   END SetFormula;
+
+  PROCEDURE SetFormat*(viewDoc: Doc.Doc; col, row: INTEGER;
+                       format: ARRAY OF CHAR);
+  (* Set or clear the format= binding for (col, row). Empty `format`
+     drops the binding; if no other bindings remain, removes the
+     whole @cell line. Existing formula= is preserved. *)
+    VAR start, end, pos: INTEGER;
+        oldFormula, oldFormat: ARRAY MaxFormat OF CHAR;
+  BEGIN
+    existingBindings(viewDoc.buf, col, row, oldFormula, oldFormat);
+    IF findCellLine(viewDoc.buf, col, row, start, end) THEN
+      Buffer.Delete(viewDoc.buf, start, end);
+      pos := start
+    ELSE
+      pos := viewDoc.buf.len;
+      ensureTrailingNL(viewDoc.buf, pos)
+    END;
+    IF (oldFormula[0] # 0X) OR (format[0] # 0X) THEN
+      writeCellLine(viewDoc.buf, pos, col, row, oldFormula, format)
+    END;
+    Lines.Invalidate(viewDoc.lines)
+  END SetFormat;
 
   PROCEDURE ClearCell*(viewDoc: Doc.Doc; col, row: INTEGER);
   (* Remove any @cell override line for (col, row). No-op if none. *)
@@ -438,16 +534,32 @@ MODULE SpreadsheetView;
     i := 0; WHILE i < n DO TUI.Write(" "); INC(i) END
   END drawSpaces;
 
-  PROCEDURE drawCellText(text: ARRAY OF CHAR; width: INTEGER; highlight: BOOLEAN);
+  PROCEDURE drawCellText(text: ARRAY OF CHAR; width: INTEGER;
+                         highlight, bold: BOOLEAN);
     VAR i, n: INTEGER;
   BEGIN
-    IF highlight THEN TUI.SetAttr(TUI.AttrReverse) END;
+    IF highlight OR bold THEN TUI.SetAttr(TUI.AttrReverse) END;
     n := strLen(text); i := 0;
     WHILE (i < n) & (i < width) DO TUI.Write(text[i]); INC(i) END;
     WHILE i < width DO TUI.Write(" "); INC(i) END;
-    IF highlight THEN TUI.SetAttr(TUI.AttrNormal) END;
+    IF highlight OR bold THEN TUI.SetAttr(TUI.AttrNormal) END;
     TUI.Write(" ")
   END drawCellText;
+
+  PROCEDURE cellFormat(VAR cells: CellList; col, row: INTEGER;
+                       VAR fmt: ARRAY OF CHAR);
+    VAR i: INTEGER; done: BOOLEAN;
+  BEGIN
+    fmt[0] := 0X;
+    i := 0; done := FALSE;
+    WHILE (i < cells.n) & ~done DO
+      IF (cells.cells[i].col = col) & (cells.cells[i].row = row) THEN
+        copyStr(fmt, cells.cells[i].format);
+        done := TRUE
+      END;
+      INC(i)
+    END
+  END cellFormat;
 
   PROCEDURE drawColLabel(col, width: INTEGER);
     VAR label: ARRAY 4 OF CHAR;
@@ -479,7 +591,8 @@ MODULE SpreadsheetView;
                     VAR cursRow, cursCol: INTEGER);
     VAR row, col, screenRow, visibleCols: INTEGER;
         val: ARRAY MaxCellValue OF CHAR;
-        isCur: BOOLEAN;
+        fmt: ARRAY MaxFormat OF CHAR;
+        isCur, isBold: BOOLEAN;
   BEGIN
     (* Bind eval state for cellLookup. *)
     evalView  := viewDoc;
@@ -516,12 +629,14 @@ MODULE SpreadsheetView;
       col := leftCol;
       WHILE col < leftCol + visibleCols DO
         composeCell(col, row, val);
+        cellFormat(cells, col, row, fmt);
+        isBold := strEq(fmt, "bold");
         isCur := (row = curRow) & (col = curCol);
         IF isCur THEN
           cursRow := screenRow;
           cursCol := RowLabelW + 1 + (col - leftCol) * (DefaultColW + 1)
         END;
-        drawCellText(val, DefaultColW, isCur);
+        drawCellText(val, DefaultColW, isCur, isBold);
         INC(col)
       END;
       INC(row); INC(screenRow)
