@@ -6,16 +6,15 @@
 # The compiler emits intermediate .o / .ll / .smb / .deps files alongside
 # the .Mod sources in src/; `make clean` removes them along with bin/.
 #
-# Env.Mod (argv access) and Out.Mod (stdout test helper) live in
-# ../oc/oberon/ — the compiler's standard runtime location — so any
-# program that imports them picks them up automatically without
-# listing the corresponding _rt.c file as an extra.
+# Env.Mod (argv access), Out.Mod (stdout test helper), and TUI.Mod
+# (terminal I/O) live in ../oc/runtime/posix/ — the compiler's
+# standard runtime location — so any program that imports them
+# picks them up automatically without listing the corresponding
+# _rt.c file as an extra.
 
 OC  ?= ../oc/bin/oc
 SRC := src
 BIN := bin
-
-RUNTIMES := $(SRC)/TUI_rt.c
 
 .PHONY: all run test check clean
 
@@ -24,11 +23,11 @@ all: $(BIN)/oed $(BIN)/tuitest $(BIN)/buftest $(BIN)/linestest $(BIN)/csvtest $(
 $(BIN):
 	mkdir -p $(BIN)
 
-$(BIN)/oed: $(SRC)/Oed.Mod $(SRC)/TUI.Mod $(SRC)/Buffer.Mod $(SRC)/Lines.Mod $(SRC)/Mini.Mod $(SRC)/Doc.Mod $(SRC)/Viewers.Mod $(SRC)/Project.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Collection.Mod $(SRC)/Csv.Mod $(SRC)/Expr.Mod $(SRC)/TableView.Mod $(SRC)/FormView.Mod $(SRC)/SpreadsheetView.Mod $(SRC)/TUI_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/Oed.Mod $(RUNTIMES)
+$(BIN)/oed: $(SRC)/Oed.Mod $(SRC)/Buffer.Mod $(SRC)/Lines.Mod $(SRC)/Mini.Mod $(SRC)/Doc.Mod $(SRC)/Viewers.Mod $(SRC)/Project.Mod $(SRC)/Schema.Mod $(SRC)/Directive.Mod $(SRC)/Collection.Mod $(SRC)/Csv.Mod $(SRC)/Expr.Mod $(SRC)/TableView.Mod $(SRC)/FormView.Mod $(SRC)/SpreadsheetView.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/Oed.Mod
 
-$(BIN)/tuitest: $(SRC)/TUITest.Mod $(SRC)/TUI.Mod $(SRC)/TUI_rt.c | $(BIN)
-	$(OC) -o $@ $(SRC)/TUITest.Mod $(RUNTIMES)
+$(BIN)/tuitest: $(SRC)/TUITest.Mod | $(BIN)
+	$(OC) -o $@ $(SRC)/TUITest.Mod
 
 $(BIN)/buftest: $(SRC)/BufferTest.Mod $(SRC)/Buffer.Mod | $(BIN)
 	$(OC) -o $@ $(SRC)/BufferTest.Mod
