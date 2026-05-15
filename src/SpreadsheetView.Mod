@@ -647,6 +647,16 @@ MODULE SpreadsheetView;
   BEGIN RETURN DefaultColW
   END ColumnWidth;
 
+  PROCEDURE VisibleColumns*(screenCols: INTEGER): INTEGER;
+  (* How many A1 columns fit on the screen, accounting for the row
+     label gutter and per-column separator. *)
+    VAR n: INTEGER;
+  BEGIN
+    n := (screenCols - RowLabelW - 1) DIV (DefaultColW + 1);
+    IF n < 1 THEN n := 1 END;
+    RETURN n
+  END VisibleColumns;
+
 BEGIN
   evalScope.cell := cellLookup;
   evalScope.col := NIL;

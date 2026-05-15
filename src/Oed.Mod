@@ -25,6 +25,8 @@ MODULE Oed;
     cur:     INTEGER;          (* text: cursor pos; table: row index *)
     top:     INTEGER;          (* text: top-line pos; table: top-row index *)
     curCol:  INTEGER;          (* table: column index; ignored for text *)
+    leftCol: INTEGER;          (* table/spreadsheet: first visible column;
+                                  form: first visible char offset *)
     dataDoc: Doc.Doc;          (* table: backing data Doc; else NIL *)
     name:    ARRAY NameLen OF CHAR;
     mode:    INTEGER;
@@ -467,6 +469,7 @@ MODULE Oed;
 
   PROCEDURE ScrollToCursor;
     VAR curLine, lineCol, topLine, topCol, viewportRows, dataRows: INTEGER;
+        visible: INTEGER;
         v: Viewers.Viewer;
   BEGIN
     viewportRows := TUI.Rows - 2;
@@ -480,7 +483,25 @@ MODULE Oed;
       IF cur < top THEN top := cur
       ELSIF cur >= top + dataRows THEN top := cur - dataRows + 1
       END;
-      IF top < 0 THEN top := 0 END
+      IF top < 0 THEN top := 0 END;
+      (* Horizontal scroll. For tables we ask the renderer how many
+         columns fit starting at leftCol (their widths vary); for
+         spreadsheets the column width is uniform. *)
+      IF curCol < leftCol THEN leftCol := curCol END;
+      IF leftCol < 0 THEN leftCol := 0 END;
+      IF v.kind = Viewers.KSpreadsheetView THEN
+        visible := SpreadsheetView.VisibleColumns(TUI.Cols);
+        IF curCol >= leftCol + visible THEN
+          leftCol := curCol - visible + 1
+        END
+      ELSE
+        WHILE (v.doc.schema # NIL) & (curCol >= leftCol)
+              & (curCol >= leftCol
+                          + TableView.VisibleColumns(v.doc.schema, leftCol, TUI.Cols)) DO
+          INC(leftCol)
+        END
+      END;
+      IF leftCol < 0 THEN leftCol := 0 END
     ELSE
       Lines.Locate(lines, cur, curLine, lineCol);
       Lines.Locate(lines, top, topLine, topCol);
@@ -641,6 +662,7 @@ MODULE Oed;
       top     := v.top;
       mark    := v.mark;
       curCol  := v.curCol;
+      leftCol := v.leftCol;
       dataDoc := v.dataDoc;
       CopyStr(name, v.doc.name)
     END
@@ -654,10 +676,11 @@ MODULE Oed;
   BEGIN
     v := Viewers.Current();
     IF v # NIL THEN
-      v.cur    := cur;
-      v.top    := top;
-      v.mark   := mark;
-      v.curCol := curCol
+      v.cur     := cur;
+      v.top     := top;
+      v.mark    := mark;
+      v.curCol  := curCol;
+      v.leftCol := leftCol
     END
   END detachCurrent;
 
@@ -1015,12 +1038,33 @@ MODULE Oed;
 
   (* ---------------- rendering ---------------- *)
 
+  (* Peek the byte length of the unbroken run of non-whitespace
+     starting at startPos. Used by the word-wrap renderer to decide
+     whether the upcoming word fits on the current screen row. *)
+  PROCEDURE peekWordLen(b: Buffer.Buffer; startPos: INTEGER): INTEGER;
+    VAR r2: Buffer.Reader; ch: CHAR; n: INTEGER;
+  BEGIN
+    Buffer.OpenReader(r2, b, startPos);
+    n := 0;
+    Buffer.Read(r2, ch);
+    WHILE ~r2.eot & (ch # Newline) & (ch # " ") & (ch # 9X) DO
+      INC(n); Buffer.Read(r2, ch)
+    END;
+    RETURN n
+  END peekWordLen;
+
+  (* Word-wrap renderer for text-like Docs (kText / kCollection /
+     anything else that ends up in this branch). Walks bytes from
+     `top` (the start of a logical line), emits them with screen-row
+     advancement when a word would otherwise overflow TUI.Cols.
+     Logical newlines flush to the next screen row regardless. *)
   PROCEDURE DrawBufferAndLocateCursor(VAR cursRow, cursCol: INTEGER);
     VAR r: Buffer.Reader; ch: CHAR;
-        pos, row, col, viewportRows: INTEGER;
+        pos, row, col, viewportRows, wordLen, j: INTEGER;
         done: BOOLEAN;
   BEGIN
     viewportRows := TUI.Rows - 2;
+    IF viewportRows < 1 THEN viewportRows := 1 END;
     Buffer.OpenReader(r, buf, top);
     pos := top; row := 0; col := 0;
     cursRow := 0; cursCol := 0;
@@ -1032,23 +1076,49 @@ MODULE Oed;
       IF r.eot THEN
         done := TRUE
       ELSIF ch = Newline THEN
-        INC(row);
+        INC(row); col := 0;
         IF row >= viewportRows THEN
           done := TRUE
         ELSE
           TUI.MoveTo(0, row); TUI.ClearLine;
-          col := 0;
-          INC(pos);
-          Buffer.Read(r, ch)
+          INC(pos); Buffer.Read(r, ch)
+        END
+      ELSIF (ch = " ") OR (ch = 9X) THEN
+        IF col >= TUI.Cols THEN
+          INC(row); col := 0;
+          IF row >= viewportRows THEN done := TRUE
+          ELSE TUI.MoveTo(0, row); TUI.ClearLine
+          END
+        END;
+        IF ~done THEN
+          TUI.Write(ch); INC(col);
+          INC(pos); Buffer.Read(r, ch)
         END
       ELSE
-        IF col < TUI.Cols THEN TUI.Write(ch) END;
-        INC(col); INC(pos);
-        Buffer.Read(r, ch)
+        (* Word-starting byte. Look ahead to see if it fits. *)
+        wordLen := peekWordLen(buf, pos);
+        IF (col > 0) & (col + wordLen > TUI.Cols) THEN
+          INC(row); col := 0;
+          IF row >= viewportRows THEN done := TRUE
+          ELSE TUI.MoveTo(0, row); TUI.ClearLine
+          END
+        END;
+        j := 0;
+        WHILE ~done & (j < wordLen) DO
+          IF pos = cur THEN cursRow := row; cursCol := col END;
+          TUI.Write(ch); INC(col);
+          IF col >= TUI.Cols THEN
+            INC(row); col := 0;
+            IF row >= viewportRows THEN done := TRUE
+            ELSE TUI.MoveTo(0, row); TUI.ClearLine
+            END
+          END;
+          INC(pos); INC(j);
+          IF ~done THEN Buffer.Read(r, ch) END
+        END
       END
     END;
-    (* Tilde-fill remaining rows. row holds the last row touched
-       (or one past the last newline written into); fill from row+1. *)
+    (* Tilde-fill remaining rows from row+1. *)
     INC(row);
     WHILE row < viewportRows DO
       TUI.MoveTo(0, row); TUI.ClearLine; TUI.Write("~");
@@ -1127,9 +1197,11 @@ MODULE Oed;
     END;
     IF (v # NIL)
         & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
-      TableView.Render(v.doc, v.dataDoc, top, cur, curCol, TUI.Rows - 2);
+      TableView.Render(v.doc, v.dataDoc, top, leftCol, cur, curCol,
+                       TUI.Rows - 2);
       cursRow := cur - top + 1;                  (* +1 for header row *)
       cursCol := TableView.ColumnX(v.doc.schema, curCol)
+                  - TableView.ColumnX(v.doc.schema, leftCol)
     ELSIF (v # NIL) & (v.kind = Viewers.KFormView) THEN
       FormView.Render(v.doc, v.dataDoc, top, cur, TUI.Rows - 2,
                       cursRow, cursCol)
@@ -1137,7 +1209,7 @@ MODULE Oed;
       ssCells.n := 0;
       SpreadsheetView.Parse(v.doc.buf, v.doc.schema, ssRefPath, ssCells);
       SpreadsheetView.Render(v.doc, v.dataDoc, ssCells,
-                             top, 0, cur, curCol, TUI.Rows - 2,
+                             top, leftCol, cur, curCol, TUI.Rows - 2,
                              cursRow, cursCol)
     ELSE
       DrawBufferAndLocateCursor(cursRow, cursCol)

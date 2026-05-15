@@ -35,6 +35,8 @@ MODULE Viewers;
       top*:     INTEGER;        (* text: top-line byte; table: top-row index *)
       mark*:    INTEGER;        (* text: selection mark; -1 if unset *)
       curCol*:  INTEGER;        (* table/form: column index; ignored for text *)
+      leftCol*: INTEGER;        (* table/spreadsheet: first visible column;
+                                   form: first visible character offset *)
       dataDoc*: Doc.Doc         (* table/form: backing data Doc via @ref; else NIL *)
     END;
 
@@ -99,6 +101,7 @@ MODULE Viewers;
     v.top     := 0;
     v.mark    := -1;
     v.curCol  := 0;
+    v.leftCol := 0;
     v.dataDoc := NIL;
     RETURN v
   END New;

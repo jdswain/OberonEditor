@@ -161,13 +161,31 @@ MODULE TableView;
     RETURN x
   END ColumnX;
 
-  PROCEDURE drawHeader(sch: Schema.Schema; row: INTEGER);
+  PROCEDURE VisibleColumns*(sch: Schema.Schema;
+                            leftCol, screenCols: INTEGER): INTEGER;
+  (* How many projection columns fit on the screen if rendering
+     starts at `leftCol`. *)
+    VAR i, x, n: INTEGER;
+  BEGIN
+    n := 0;
+    IF sch # NIL THEN
+      i := leftCol; x := 0;
+      WHILE (i < sch.ncol)
+            & (x + columnWidth(sch.cols[i]) + 1 <= screenCols) DO
+        x := x + columnWidth(sch.cols[i]) + 1;
+        INC(n); INC(i)
+      END
+    END;
+    RETURN n
+  END VisibleColumns;
+
+  PROCEDURE drawHeader(sch: Schema.Schema; row, leftCol, visibleCols: INTEGER);
     VAR i: INTEGER;
   BEGIN
     TUI.MoveTo(0, row); TUI.ClearLine;
     TUI.SetAttr(TUI.AttrReverse);
-    i := 0;
-    WHILE i < sch.ncol DO
+    i := leftCol;
+    WHILE (i < sch.ncol) & (i < leftCol + visibleCols) DO
       drawCell(sch.cols[i].label, columnWidth(sch.cols[i]), FALSE);
       INC(i)
     END;
@@ -186,11 +204,11 @@ MODULE TableView;
 
   PROCEDURE drawRow(viewSch, dataSch: Schema.Schema;
                     VAR fields: rowBuf; nFields: INTEGER;
-                    isCur: BOOLEAN; curCol: INTEGER);
+                    isCur: BOOLEAN; curCol, leftCol, visibleCols: INTEGER);
     VAR j, idx: INTEGER; empty: ARRAY 4 OF CHAR;
   BEGIN
-    j := 0;
-    WHILE j < viewSch.ncol DO
+    j := leftCol;
+    WHILE (j < viewSch.ncol) & (j < leftCol + visibleCols) DO
       idx := Schema.Find(dataSch, viewSch.cols[j].name);
       IF (idx < 0) OR (idx >= nFields) THEN
         empty[0] := 0X;
@@ -203,16 +221,18 @@ MODULE TableView;
   END drawRow;
 
   PROCEDURE Render*(viewDoc, dataDoc: Doc.Doc;
-                    topRow, curRow, curCol: INTEGER;
+                    topRow, leftCol, curRow, curCol: INTEGER;
                     viewportRows: INTEGER);
   (* Draws the table from screen row 0 down. Caller manages the
      status bar / message line. dataDoc may be NIL — we then render
      a "data unavailable" notice. *)
     VAR c: Collection.Collection; it: Collection.RowIter;
-        n, r: INTEGER;
+        n, r, visibleCols: INTEGER;
         fields: rowBuf; nFields: INTEGER;
   BEGIN
-    drawHeader(viewDoc.schema, 0);
+    visibleCols := VisibleColumns(viewDoc.schema, leftCol, TUI.Cols);
+    IF visibleCols < 1 THEN visibleCols := 1 END;
+    drawHeader(viewDoc.schema, 0, leftCol, visibleCols);
     IF (dataDoc = NIL) OR (dataDoc.schema = NIL) THEN
       TUI.MoveTo(0, 1); TUI.ClearLine;
       TUI.WriteStr("  (no backing data — @ref not resolved)");
@@ -239,7 +259,7 @@ MODULE TableView;
         ELSE
           readRowFields(it, fields, nFields);
           drawRow(viewDoc.schema, dataDoc.schema, fields, nFields,
-                  n = curRow, curCol);
+                  n = curRow, curCol, leftCol, visibleCols);
           Collection.NextRow(it)
         END;
         INC(n); INC(r)
