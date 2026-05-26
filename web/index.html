@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>oed — Oberon-07 terminal editor (web)</title>
+<style>
+  /* 3270 webfont — BSD-3-Clause. License at fonts/LICENSE.txt. */
+  @font-face {
+    font-family: "3270";
+    src: url("fonts/3270-Regular.ttf") format("truetype");
+    font-weight: 400; font-style: normal; font-display: swap;
+  }
+
+  :root { --tui-bg: #000; --tui-fg: #00cc66; --tui-cursor: #00cc66; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: var(--tui-bg);
+    color: var(--tui-fg);
+    display: flex;
+    flex-direction: column;
+  }
+  #term {
+    flex: 1;
+    min-height: 0;
+    font-family: "3270", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 18px;
+    line-height: 1.1;
+    background: var(--tui-bg);
+    color: var(--tui-fg);
+    padding: 0;
+    outline: none;
+    cursor: text;
+    white-space: pre;
+    overflow: hidden;
+  }
+  /* Lock every row to 1.1em so the cursor landing on a previously
+     empty row doesn't push later rows down (no vertical reflow). */
+  #term div  { line-height: 1.1em; height: 1.1em; }
+</style>
+
+<div id="term" tabindex="0" data-wasm="oed.wasm"></div>
+
+<script type="module" src="dist/main.js"></script>

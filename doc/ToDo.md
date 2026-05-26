@@ -63,11 +63,11 @@ x Status-bar and scroll calls now O(log lines) instead of O(buffer.len).
 ## Feature ideas
 
 - **Search-and-replace** (uses Mini for both prompts; reuses `Buffer.Find`).
-- **Undo/redo** — wants a real change-log layer over Buffer (record Insert/Delete with their args; replay in reverse).
+x **Undo/redo** — wants a real change-log layer over Buffer (record Insert/Delete with their args; replay in reverse).
 - **`M-d` / `M-Backspace`** kill-word-forward / kill-word-backward. Composes word motion + kill. The Meta plumbing is already warm.
 - **`C-l`** (currently no-op) → recenter viewport on cursor.
 - **Auto-indent** on Enter — copy leading whitespace from previous line.
-- **Soft line wrapping.** When a buffer line exceeds `TUI.Cols`, wrap visually within the same logical line. Means Lines becomes width-aware and the render walk has to handle screen-row vs buffer-line separation.
+x **Soft line wrapping.** When a buffer line exceeds `TUI.Cols`, wrap visually within the same logical line. Means Lines becomes width-aware and the render walk has to handle screen-row vs buffer-line separation.
 
 # Tables (future feature, separate from above)
 

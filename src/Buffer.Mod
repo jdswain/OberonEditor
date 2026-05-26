@@ -38,6 +38,24 @@ MODULE Buffer;
     Orig   = 0;               (* Piece.src tags *)
     Append = 1;
 
+    (* Undo / redo ring. UndoCap is the number of slots in each
+       direction; MaxEditLen caps the captured text we can carry for
+       a single ActInsert entry (ActDelete carries no text — it's just
+       pos + len).
+
+       An entry's `kind` describes what to DO when applying it. The
+       ring entries on the undo stack are inverses of the user's
+       edits (Inserts pair with ActDelete entries, Deletes pair with
+       ActInsert entries that hold the deleted bytes). Apply Undo
+       runs the entry's action and pushes the symmetric inverse onto
+       the redo stack; Redo runs and pushes onto undo. *)
+    UndoCap    = 32;
+    MaxEditLen = 4096;
+
+    ActSkip   = 0;            (* too-large delete; cannot replay *)
+    ActInsert = 1;            (* apply: Insert text at pos *)
+    ActDelete = 2;            (* apply: Delete [pos, pos+len) *)
+
   TYPE
     Buffer* = POINTER TO BufferDesc;
 
@@ -67,6 +85,17 @@ MODULE Buffer;
       prev: WEAK POINTER TO PieceDesc
     END;
 
+    (* One reversible edit recorded for undo / redo. Allocated on
+       demand; ring slots hold POINTERs so unused slots cost only a
+       pointer per buffer rather than MaxEditLen of text. *)
+    Edit = POINTER TO EditDesc;
+    EditDesc = RECORD
+      kind: INTEGER;
+      pos:  INTEGER;
+      len:  INTEGER;
+      text: ARRAY MaxEditLen OF CHAR   (* used only when kind = ActInsert *)
+    END;
+
     BufferDesc* = RECORD
       len*:     INTEGER;     (* total character count *)
       changed*: BOOLEAN;     (* dirty since last Load/Save *)
@@ -75,7 +104,18 @@ MODULE Buffer;
       cache:    Piece;       (* last-found piece for FindPiece locality *)
       cacheOrg: INTEGER;     (* logical offset of cache piece's start *)
       orig:     Region;
-      append:   Region
+      append:   Region;
+
+      (* Undo / redo state. recording suppresses ring pushes while
+         Undo / Redo is itself mutating the chain (otherwise the
+         inverse op would push its own undo entry and infinite-loop). *)
+      recording:  BOOLEAN;
+      undoHead:   INTEGER;
+      undoCount:  INTEGER;
+      undoRing:   ARRAY UndoCap OF Edit;
+      redoHead:   INTEGER;
+      redoCount:  INTEGER;
+      redoRing:   ARRAY UndoCap OF Edit
     END;
 
     Reader* = RECORD
@@ -160,6 +200,115 @@ MODULE Buffer;
     END
   END SplitPiece;
 
+  (* ---------------- Undo / redo (private helpers) ---------------- *)
+
+  PROCEDURE byteAt(b: Buffer; pos: INTEGER): CHAR;
+    VAR org: INTEGER; p: Piece; ch: CHAR;
+  BEGIN
+    IF (pos < 0) OR (pos >= b.len) THEN
+      ch := 0X
+    ELSE
+      FindPiece(b, pos, org, p);
+      ch := getByte(b, p.src, p.off + (pos - org))
+    END;
+    RETURN ch
+  END byteAt;
+
+  PROCEDURE clearRing(VAR ring: ARRAY OF Edit;
+                      VAR head, count: INTEGER);
+  BEGIN head := 0; count := 0
+  END clearRing;
+
+  (* Read len bytes from b at pos into out[0..len-1]. Used to capture
+     deleted text before the actual chain mutation. *)
+  PROCEDURE readInto(b: Buffer; pos, len: INTEGER;
+                     VAR out: ARRAY OF CHAR);
+    VAR i: INTEGER;
+  BEGIN
+    i := 0;
+    WHILE i < len DO out[i] := byteAt(b, pos + i); INC(i) END
+  END readInto;
+
+  (* Push entry into ring at the next slot. Reuses the slot's parked
+     Edit record when present, otherwise allocates. *)
+  PROCEDURE ringPush(VAR ring: ARRAY OF Edit;
+                     VAR head, count: INTEGER;
+                     kind, pos, len: INTEGER;
+                     text: ARRAY OF CHAR; copyText: BOOLEAN);
+    VAR slot, i: INTEGER; e: Edit;
+  BEGIN
+    IF count = 0 THEN
+      slot := 0
+    ELSE
+      head := (head + 1) MOD UndoCap;
+      slot := head
+    END;
+    e := ring[slot];
+    IF e = NIL THEN NEW(e); ring[slot] := e END;
+    e.kind := kind; e.pos := pos; e.len := len;
+    IF copyText THEN
+      i := 0;
+      WHILE (i < len) & (i < MaxEditLen) DO
+        e.text[i] := text[i]; INC(i)
+      END
+    END;
+    IF count < UndoCap THEN INC(count) END
+  END ringPush;
+
+  PROCEDURE ringPop(VAR head, count: INTEGER);
+  BEGIN
+    DEC(count);
+    IF count > 0 THEN head := (head - 1 + UndoCap) MOD UndoCap
+    ELSE head := 0
+    END
+  END ringPop;
+
+  (* User did Insert(pos, len chars). The undo action is the
+     inverse — ActDelete [pos, pos+len). Coalesce with the head
+     entry when adjacent: typing "hello" makes one ActDelete
+     spanning all five chars, not five entries. *)
+  PROCEDURE recordInsert(b: Buffer; pos, len: INTEGER);
+    VAR head: Edit; empty: ARRAY 1 OF CHAR; coalesced: BOOLEAN;
+  BEGIN
+    IF b.recording THEN
+      coalesced := FALSE;
+      IF b.undoCount > 0 THEN
+        head := b.undoRing[b.undoHead];
+        IF (head.kind = ActDelete) & (head.pos + head.len = pos) THEN
+          head.len := head.len + len;
+          coalesced := TRUE
+        END
+      END;
+      IF ~coalesced THEN
+        empty[0] := 0X;
+        ringPush(b.undoRing, b.undoHead, b.undoCount,
+                 ActDelete, pos, len, empty, FALSE)
+      END;
+      clearRing(b.redoRing, b.redoHead, b.redoCount)
+    END
+  END recordInsert;
+
+  (* User did Delete([pos, pos+len)). The undo action is the
+     inverse — ActInsert with a copy of the bytes leaving the
+     chain. Deletes larger than MaxEditLen get an ActSkip marker;
+     undo of those is a no-op. *)
+  PROCEDURE recordDelete(b: Buffer; pos, len: INTEGER);
+    VAR buf: ARRAY MaxEditLen OF CHAR; empty: ARRAY 1 OF CHAR;
+  BEGIN
+    IF b.recording THEN
+      IF len > MaxEditLen THEN
+        empty[0] := 0X;
+        ringPush(b.undoRing, b.undoHead, b.undoCount,
+                 ActSkip, pos, len, empty, FALSE)
+      ELSE
+        readInto(b, pos, len, buf);
+        ringPush(b.undoRing, b.undoHead, b.undoCount,
+                 ActInsert, pos, len, buf, TRUE)
+      END;
+      clearRing(b.redoRing, b.redoHead, b.redoCount)
+    END
+  END recordDelete;
+
   (* ---------------- Construction ---------------- *)
 
   (* Drop any existing chain and reset to the empty state.
@@ -178,7 +327,11 @@ MODULE Buffer;
     b.trailer.next := NIL;
     b.trailer.prev := NIL;
     b.len        := 0;
-    b.changed    := FALSE
+    b.changed    := FALSE;
+    (* Loading / clearing the buffer invalidates any prior undo
+       state: the chain those entries refer to is gone. *)
+    clearRing(b.undoRing, b.undoHead, b.undoCount);
+    clearRing(b.redoRing, b.redoHead, b.redoCount)
   END reset;
 
   PROCEDURE New*(): Buffer;
@@ -196,6 +349,9 @@ MODULE Buffer;
     b.cacheOrg := 0;
     b.len      := 0;
     b.changed  := FALSE;
+    b.recording := TRUE;
+    b.undoHead := 0; b.undoCount := 0;
+    b.redoHead := 0; b.redoCount := 0;
     RETURN b
   END New;
 
@@ -294,6 +450,7 @@ MODULE Buffer;
     IF pos < 0 THEN pos := 0
     ELSIF pos > b.len THEN pos := b.len
     END;
+    recordInsert(b, pos, 1);
     appendOff := appendByte(b, ch);
     FindPiece(b, pos, org, p);
     SplitPiece(p, pos - org, pr);
@@ -345,6 +502,7 @@ MODULE Buffer;
     IF beg < 0 THEN beg := 0 END;
     IF end > b.len THEN end := b.len END;
     IF beg < end THEN
+      recordDelete(b, beg, end - beg);
       FindPiece(b, beg, orgb, pb); SplitPiece(pb, beg - orgb, pbr);
       FindPiece(b, end, orge, pe); SplitPiece(pe, end - orge, per);
       pl := pbr.prev;
@@ -368,6 +526,95 @@ MODULE Buffer;
       END
     END
   END Delete;
+
+  (* ---------------- Undo / redo (public) ---------------- *)
+
+  (* Apply an entry to b. Returns the natural post-apply cursor
+     position via `landing` — start of a deleted region, or end of
+     an inserted one — and writes the inverse entry that should
+     end up on the opposite stack into out{Kind,Pos,Len,Text}.
+     Caller pushes the inverse and pops the source ring. *)
+  PROCEDURE applyEdit(b: Buffer; e: Edit;
+                      VAR landing: INTEGER;
+                      VAR outKind, outLen: INTEGER;
+                      VAR outText: ARRAY OF CHAR);
+    VAR i: INTEGER;
+  BEGIN
+    outLen  := e.len;
+    outKind := ActSkip;       (* default for the ActSkip branch *)
+    IF e.kind = ActDelete THEN
+      IF e.len <= MaxEditLen THEN
+        readInto(b, e.pos, e.len, outText);
+        outKind := ActInsert
+      END;
+      Delete(b, e.pos, e.pos + e.len);
+      landing := e.pos
+    ELSIF e.kind = ActInsert THEN
+      i := 0;
+      WHILE i < e.len DO
+        Insert(b, e.pos + i, e.text[i]); INC(i)
+      END;
+      outKind := ActDelete;
+      landing := e.pos + e.len
+    ELSE  (* ActSkip — cannot apply *)
+      landing := e.pos
+    END
+  END applyEdit;
+
+  (* Pop the head of the undo stack, apply it, push the inverse
+     onto the redo stack. Returns FALSE when the undo ring is empty.
+     `pos` is the natural cursor landing position. *)
+  PROCEDURE Undo*(b: Buffer; VAR pos: INTEGER): BOOLEAN;
+    VAR e: Edit;
+        text: ARRAY MaxEditLen OF CHAR;
+        outKind, outLen: INTEGER;
+        ok: BOOLEAN;
+  BEGIN
+    ok := b.undoCount > 0;
+    IF ok THEN
+      e := b.undoRing[b.undoHead];
+      b.recording := FALSE;
+      applyEdit(b, e, pos, outKind, outLen, text);
+      ringPush(b.redoRing, b.redoHead, b.redoCount,
+               outKind, e.pos, outLen, text, outKind = ActInsert);
+      b.recording := TRUE;
+      ringPop(b.undoHead, b.undoCount)
+    END;
+    RETURN ok
+  END Undo;
+
+  PROCEDURE Redo*(b: Buffer; VAR pos: INTEGER): BOOLEAN;
+    VAR e: Edit;
+        text: ARRAY MaxEditLen OF CHAR;
+        outKind, outLen: INTEGER;
+        ok: BOOLEAN;
+  BEGIN
+    ok := b.redoCount > 0;
+    IF ok THEN
+      e := b.redoRing[b.redoHead];
+      b.recording := FALSE;
+      applyEdit(b, e, pos, outKind, outLen, text);
+      ringPush(b.undoRing, b.undoHead, b.undoCount,
+               outKind, e.pos, outLen, text, outKind = ActInsert);
+      b.recording := TRUE;
+      ringPop(b.redoHead, b.redoCount)
+    END;
+    RETURN ok
+  END Redo;
+
+  PROCEDURE ResetHistory*(b: Buffer);
+  BEGIN
+    clearRing(b.undoRing, b.undoHead, b.undoCount);
+    clearRing(b.redoRing, b.redoHead, b.redoCount)
+  END ResetHistory;
+
+  PROCEDURE SuspendRecording*(b: Buffer);
+  BEGIN b.recording := FALSE
+  END SuspendRecording;
+
+  PROCEDURE ResumeRecording*(b: Buffer);
+  BEGIN b.recording := TRUE
+  END ResumeRecording;
 
   (* ---------------- Sequential read ---------------- *)
 

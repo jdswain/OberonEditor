@@ -1,12 +1,30 @@
 MODULE Oed;
-(* Editor shell. Globals mirror the current Viewer's state: buf,
-   lines and name come from the Viewer's Doc; cur, top and mark are
-   per-Viewer presentation state. The Doc/Viewer split — bytes
-   versus presentation — lives in Doc.Mod and Viewers.Mod, the first
-   step of the data-layer plan in doc/DataDDR.md. *)
+(* Editor shell + dispatcher. Owns the per-buffer mutable state
+   (buf, lines, cur, top, curCol, leftCol, dataDoc, name, mark,
+   mode, running, status, ssCells) that mirrors the current
+   Viewer's fields; attachCurrent / detachCurrent sync it with the
+   registry on buffer switch.
+
+   Most behaviour lives in dedicated modules:
+     Strings    text / int helpers
+     Motion     cursor movement (char, word, sentence, line, page)
+     KillRing   mark + rotating kill ring + region ops
+     Search     incremental search loop
+     Render     word-wrap text renderer + markdown link styling
+     FileOps    save / save-as / save-all
+     BufList    *viewers* synthesis + buffer-name completer
+   Oed.Mod itself keeps the per-kind entry-key dispatchers (Table
+   / Form / Spreadsheet), the viewer-attach plumbing, the open
+   chain (which creates Viewers and is tangled with refreshSchema /
+   loadViewData), and the Run main loop.
+
+   The Doc/Viewer split — bytes versus presentation — lives in
+   Doc.Mod and Viewers.Mod, the first step of the data-layer plan
+   in doc/DataDDR.md. *)
 
   IMPORT TUI, Buffer, Lines, Env, Mini, Files, Schema, Csv, Doc, Viewers, Project,
-         Collection, Expr, TableView, FormView, SpreadsheetView;
+         Collection, Expr, TableView, FormView, SpreadsheetView, Strings, KillRing,
+         Motion, Render, Search, BufList, FileOps, Links, History, FileBrowser;
 
   CONST
     ModeEntry   = 0;
@@ -14,8 +32,6 @@ MODULE Oed;
 
     StatusLen    = 96;
     NameLen      = 64;
-    KillCap      = 4096;       (* upper bound on a single kill / copy *)
-    KillRingSize = 8;          (* slots in the rotating kill ring *)
 
     Newline = 0AX;
 
@@ -32,66 +48,49 @@ MODULE Oed;
     mode:    INTEGER;
     running: BOOLEAN;
     status:  ARRAY StatusLen OF CHAR;
-    mark:        INTEGER;      (* -1 when unset *)
-    killRing:    ARRAY KillRingSize OF ARRAY KillCap OF CHAR;
-    killLens:    ARRAY KillRingSize OF INTEGER;
-    killHead:    INTEGER;      (* index of most recent entry *)
-    killCount:   INTEGER;      (* valid entries 0..KillRingSize *)
-    yankIndex:   INTEGER;      (* offset back from killHead for current yank *)
-    yankStart:   INTEGER;      (* buffer pos where current yank text starts *)
-    yankLen:     INTEGER;      (* length of current yank text *)
-    lastWasYank: BOOLEAN;      (* was the previous command Yank or YankPop? *)
-    lastWasKill: BOOLEAN;      (* successive C-k append to the same ring entry *)
-    ssCells:     SpreadsheetView.CellList;  (* re-parsed per spreadsheet refresh *)
+    mark:    INTEGER;          (* -1 when unset; mirrors v.mark via attach *)
+    ssCells: SpreadsheetView.CellList;  (* re-parsed per spreadsheet refresh *)
 
-  (* ---------------- string helpers ---------------- *)
-
-  PROCEDURE CopyStr(VAR dst: ARRAY OF CHAR; src: ARRAY OF CHAR);
-    VAR i: INTEGER;
-  BEGIN
-    i := 0;
-    WHILE (i < LEN(dst) - 1) & (i < LEN(src)) & (src[i] # 0X) DO
-      dst[i] := src[i]; INC(i)
-    END;
-    dst[i] := 0X
-  END CopyStr;
-
-  PROCEDURE AppendStr(VAR dst: ARRAY OF CHAR; src: ARRAY OF CHAR);
-    VAR i, j: INTEGER;
-  BEGIN
-    i := 0;
-    WHILE (i < LEN(dst) - 1) & (dst[i] # 0X) DO INC(i) END;
-    j := 0;
-    WHILE (i < LEN(dst) - 1) & (j < LEN(src)) & (src[j] # 0X) DO
-      dst[i] := src[j]; INC(i); INC(j)
-    END;
-    dst[i] := 0X
-  END AppendStr;
-
-  (* Copy the directory portion of path into dir, including the
-     trailing slash. dir = "" when path has no slash (cwd). *)
-  PROCEDURE DirOf(path: ARRAY OF CHAR; VAR dir: ARRAY OF CHAR);
-    VAR i, last: INTEGER;
-  BEGIN
-    last := -1; i := 0;
-    WHILE (i < LEN(path)) & (path[i] # 0X) DO
-      IF path[i] = "/" THEN last := i END;
-      INC(i)
-    END;
-    IF last < 0 THEN
-      dir[0] := 0X
-    ELSE
-      i := 0;
-      WHILE (i <= last) & (i < LEN(dir) - 1) DO
-        dir[i] := path[i]; INC(i)
-      END;
-      dir[i] := 0X
-    END
-  END DirOf;
+    (* Pending state for continuation-passing prompt flows. Each
+       prompt-initiating procedure stores any data it needs on commit
+       here, and the corresponding done callback reads it back. Since
+       the editor's globals (cur, curCol, buf, lines, name) are
+       frozen while Mini is active — Mini.HandleKey routes all
+       keystrokes to the prompt — most flows just consult those
+       globals in their done callback rather than snapshotting. *)
+    pendingKillTarget:    Viewers.Viewer;
+    pendingRowKillTarget: Viewers.Viewer;
+    pendingSaveDir:       ARRAY NameLen OF CHAR;
+    pendingLinkUS:        INTEGER;
+    pendingLinkUE:        INTEGER;
+    pendingFileDone:      Mini.PromptDone;
 
   PROCEDURE SetStatus(s: ARRAY OF CHAR);
-  BEGIN CopyStr(status, s)
+  BEGIN Strings.Copy(status, s)
   END SetStatus;
+
+  (* ---------------- filename Tab → FileBrowser ---------------- *)
+
+  (* Mini's Tab handler runs in two phases: launchBrowser stashes
+     Mini's done callback into pendingFileDone (declared at the top
+     of the module) and starts the browser; browserCommitDone fires
+     when the user picks a file (or cancels), forwarding the chosen
+     path back through the stashed done as if Enter had been
+     pressed in Mini. *)
+
+  PROCEDURE browserCommitDone(path: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR cb: Mini.PromptDone;
+  BEGIN
+    cb := pendingFileDone; pendingFileDone := NIL;
+    IF cb # NIL THEN cb(path, ok) END
+  END browserCommitDone;
+
+  PROCEDURE launchFileBrowser(text: ARRAY OF CHAR; len: INTEGER;
+                              done: Mini.PromptDone);
+  BEGIN
+    pendingFileDone := done;
+    FileBrowser.Begin(text, browserCommitDone)
+  END launchFileBrowser;
 
   (* ---------------- editing ---------------- *)
 
@@ -118,352 +117,6 @@ MODULE Oed;
       Lines.Deleted(lines, cur, cur + 1)
     END
   END DeleteCh;
-
-  (* ---------------- mark / kill ring ---------------- *)
-
-  PROCEDURE SetMark;
-  BEGIN
-    mark := cur;
-    SetStatus("Mark set")
-  END SetMark;
-
-  (* Order mark and cur into [lo, hi). Returns FALSE when no mark is
-     active or the region is empty. *)
-  PROCEDURE rangeBounds(VAR lo, hi: INTEGER): BOOLEAN;
-    VAR ok: BOOLEAN;
-  BEGIN
-    ok := mark >= 0;
-    IF ok THEN
-      IF mark < cur THEN lo := mark; hi := cur
-      ELSE lo := cur; hi := mark
-      END;
-      ok := lo < hi
-    END;
-    RETURN ok
-  END rangeBounds;
-
-  (* Push [lo, hi) onto the head of the kill ring, capping at KillCap. *)
-  PROCEDURE pushKill(lo, hi: INTEGER);
-    VAR r: Buffer.Reader; ch: CHAR; n: INTEGER;
-  BEGIN
-    IF hi - lo > KillCap THEN hi := lo + KillCap END;
-    IF killCount > 0 THEN killHead := (killHead + 1) MOD KillRingSize END;
-    Buffer.OpenReader(r, buf, lo);
-    n := 0;
-    Buffer.Read(r, ch);
-    WHILE ~r.eot & (lo + n < hi) DO
-      killRing[killHead][n] := ch; INC(n);
-      Buffer.Read(r, ch)
-    END;
-    killLens[killHead] := n;
-    IF killCount < KillRingSize THEN INC(killCount) END
-  END pushKill;
-
-  (* Append [lo, hi) onto the current head entry instead of pushing
-     a new one. Used by successive C-k so a multi-line kill ends up in
-     a single ring slot. *)
-  PROCEDURE appendKill(lo, hi: INTEGER);
-    VAR r: Buffer.Reader; ch: CHAR; n, room: INTEGER;
-  BEGIN
-    IF killCount = 0 THEN
-      pushKill(lo, hi)
-    ELSE
-      n := killLens[killHead];
-      room := KillCap - n;
-      IF hi - lo > room THEN hi := lo + room END;
-      Buffer.OpenReader(r, buf, lo);
-      Buffer.Read(r, ch);
-      WHILE ~r.eot & (lo < hi) DO
-        killRing[killHead][n] := ch; INC(n);
-        INC(lo);
-        Buffer.Read(r, ch)
-      END;
-      killLens[killHead] := n
-    END
-  END appendKill;
-
-  (* Index of the entry yankIndex steps older than killHead. *)
-  PROCEDURE ringSlot(yi: INTEGER): INTEGER;
-  BEGIN
-    RETURN ((killHead - yi) MOD KillRingSize + KillRingSize) MOD KillRingSize
-  END ringSlot;
-
-  (* Insert killRing[slot] at cur. Common path for Yank and YankPop. *)
-  PROCEDURE insertSlot(slot: INTEGER);
-    VAR i, n: INTEGER;
-  BEGIN
-    n := killLens[slot];
-    yankStart := cur;
-    i := 0;
-    WHILE i < n DO
-      Buffer.Insert(buf, cur + i, killRing[slot][i]);
-      INC(i)
-    END;
-    cur := cur + n;
-    yankLen := n;
-    Lines.Inserted(lines, yankStart, n)
-  END insertSlot;
-
-  PROCEDURE CopyRegion;
-    VAR lo, hi: INTEGER;
-  BEGIN
-    IF rangeBounds(lo, hi) THEN
-      pushKill(lo, hi);
-      SetStatus("Region copied")
-    ELSE
-      SetStatus("No mark set")
-    END
-  END CopyRegion;
-
-  PROCEDURE KillRegion;
-    VAR lo, hi: INTEGER;
-  BEGIN
-    IF rangeBounds(lo, hi) THEN
-      pushKill(lo, hi);
-      Buffer.Delete(buf, lo, hi);
-      cur := lo;
-      mark := -1;
-      Lines.Deleted(lines, lo, hi);
-      SetStatus("Region killed")
-    ELSE
-      SetStatus("No mark set")
-    END
-  END KillRegion;
-
-  (* Kill from cursor to end of line. If already at end of line, kill
-     the newline itself (joining with the next line). Successive C-k
-     presses append to the head ring entry; any other command in
-     between resets the chain. *)
-  PROCEDURE KillLine;
-    VAR line, col, lineEnd, killTo: INTEGER;
-  BEGIN
-    Lines.Locate(lines, cur, line, col);
-    lineEnd := Lines.LineEnd(lines, line);
-    IF cur < lineEnd THEN killTo := lineEnd
-    ELSIF cur < buf.len THEN killTo := cur + 1
-    ELSE killTo := cur
-    END;
-    IF killTo > cur THEN
-      IF lastWasKill THEN appendKill(cur, killTo)
-      ELSE pushKill(cur, killTo)
-      END;
-      Buffer.Delete(buf, cur, killTo);
-      Lines.Deleted(lines, cur, killTo);
-      lastWasKill := TRUE;
-      SetStatus("Line killed")
-    ELSE
-      SetStatus("End of buffer")
-    END
-  END KillLine;
-
-  PROCEDURE Yank;
-  BEGIN
-    IF killCount = 0 THEN
-      SetStatus("Kill register empty");
-      lastWasYank := FALSE
-    ELSE
-      yankIndex := 0;
-      insertSlot(killHead);
-      lastWasYank := TRUE;
-      SetStatus("Yanked")
-    END
-  END Yank;
-
-  (* Replace the previous yank with the next-older entry from the ring.
-     Only valid immediately after a Yank or YankPop. *)
-  PROCEDURE YankPop;
-  BEGIN
-    IF ~lastWasYank THEN
-      SetStatus("Previous command was not a yank")
-    ELSIF killCount = 0 THEN
-      SetStatus("Kill ring empty");
-      lastWasYank := FALSE
-    ELSE
-      Buffer.Delete(buf, yankStart, yankStart + yankLen);
-      Lines.Deleted(lines, yankStart, yankStart + yankLen);
-      cur := yankStart;
-      yankIndex := (yankIndex + 1) MOD killCount;
-      insertSlot(ringSlot(yankIndex));
-      lastWasYank := TRUE;
-      SetStatus("Yank popped")
-    END
-  END YankPop;
-
-  (* ---------------- movement ---------------- *)
-
-  PROCEDURE MoveLeft;
-  BEGIN IF cur > 0 THEN DEC(cur) END
-  END MoveLeft;
-
-  PROCEDURE MoveRight;
-  BEGIN IF cur < buf.len THEN INC(cur) END
-  END MoveRight;
-
-  PROCEDURE MoveHome;
-    VAR line, col: INTEGER;
-  BEGIN
-    Lines.Locate(lines, cur, line, col);
-    cur := Lines.LineStart(lines, line)
-  END MoveHome;
-
-  PROCEDURE MoveEnd;
-    VAR line, col: INTEGER;
-  BEGIN
-    Lines.Locate(lines, cur, line, col);
-    cur := Lines.LineEnd(lines, line)
-  END MoveEnd;
-
-  PROCEDURE MoveUp;
-    VAR line, col, newLen, newCol: INTEGER;
-  BEGIN
-    Lines.Locate(lines, cur, line, col);
-    IF line > 0 THEN
-      newLen := Lines.LineLen(lines, line - 1);
-      IF col < newLen THEN newCol := col ELSE newCol := newLen END;
-      cur := Lines.LineStart(lines, line - 1) + newCol
-    END
-  END MoveUp;
-
-  PROCEDURE MoveDown;
-    VAR line, col, newLen, newCol: INTEGER;
-  BEGIN
-    Lines.Locate(lines, cur, line, col);
-    IF line + 1 < Lines.Count(lines) THEN
-      newLen := Lines.LineLen(lines, line + 1);
-      IF col < newLen THEN newCol := col ELSE newCol := newLen END;
-      cur := Lines.LineStart(lines, line + 1) + newCol
-    END
-  END MoveDown;
-
-  (* ---- character classes for word / sentence motion ---- *)
-
-  PROCEDURE isWord(ch: CHAR): BOOLEAN;
-  BEGIN
-    RETURN ((ch >= "0") & (ch <= "9"))
-        OR ((ch >= "A") & (ch <= "Z"))
-        OR ((ch >= "a") & (ch <= "z"))
-  END isWord;
-
-  PROCEDURE isSpace(ch: CHAR): BOOLEAN;
-  BEGIN
-    RETURN (ch = " ") OR (ch = 9X) OR (ch = 0AX) OR (ch = 0DX)
-  END isSpace;
-
-  PROCEDURE isSentEnd(ch: CHAR): BOOLEAN;
-  BEGIN RETURN (ch = ".") OR (ch = "!") OR (ch = "?")
-  END isSentEnd;
-
-  (* Random-access char read; OpenReader is amortized O(1) via
-     Buffer's piece cache. Returns 0X past end-of-text. *)
-  PROCEDURE charAt(p: INTEGER): CHAR;
-    VAR r: Buffer.Reader; ch: CHAR;
-  BEGIN
-    Buffer.OpenReader(r, buf, p);
-    Buffer.Read(r, ch);
-    IF r.eot THEN ch := 0X END;
-    RETURN ch
-  END charAt;
-
-  PROCEDURE MoveWordForward;
-  (* Skip non-word chars then word chars; lands at first non-word
-     char after the current/next word, or at b.len. *)
-    VAR r: Buffer.Reader; ch: CHAR; p: INTEGER;
-  BEGIN
-    Buffer.OpenReader(r, buf, cur);
-    p := cur;
-    Buffer.Read(r, ch);
-    WHILE ~r.eot & ~isWord(ch) DO INC(p); Buffer.Read(r, ch) END;
-    WHILE ~r.eot & isWord(ch)  DO INC(p); Buffer.Read(r, ch) END;
-    cur := p
-  END MoveWordForward;
-
-  PROCEDURE MoveWordBackward;
-  (* Walk left over non-word then word chars; lands at the start of
-     the current/previous word. *)
-    VAR p: INTEGER;
-  BEGIN
-    p := cur;
-    WHILE (p > 0) & ~isWord(charAt(p-1)) DO DEC(p) END;
-    WHILE (p > 0) &  isWord(charAt(p-1)) DO DEC(p) END;
-    cur := p
-  END MoveWordBackward;
-
-  PROCEDURE MoveSentForward;
-  (* Find next sentence-end punctuation followed by whitespace, land
-     just after the punctuation. If none found, go to end of buffer. *)
-    VAR r: Buffer.Reader; ch: CHAR; p: INTEGER;
-        pendingEnd, found: BOOLEAN;
-  BEGIN
-    Buffer.OpenReader(r, buf, cur);
-    p := cur; pendingEnd := FALSE; found := FALSE;
-    Buffer.Read(r, ch);
-    WHILE ~r.eot & ~found DO
-      IF pendingEnd & isSpace(ch) THEN
-        cur := p; found := TRUE
-      ELSE
-        IF isSentEnd(ch) THEN pendingEnd := TRUE
-        ELSIF ~isSpace(ch) THEN pendingEnd := FALSE
-        END;
-        INC(p);
-        Buffer.Read(r, ch)
-      END
-    END;
-    IF ~found THEN cur := buf.len END
-  END MoveSentForward;
-
-  PROCEDURE MoveSentBackward;
-  (* Walk from buffer start, recording each sentence-start position
-     reached (first non-space at start, then first non-space after a
-     sentence-end). Final lastStart < cur is the destination. If the
-     cursor sits at a sentence start, this lands on the previous one. *)
-    VAR r: Buffer.Reader; ch: CHAR;
-        p, lastStart: INTEGER;
-        pendingEnd, started: BOOLEAN;
-  BEGIN
-    IF cur > 0 THEN
-      Buffer.OpenReader(r, buf, 0);
-      p := 0; lastStart := 0;
-      pendingEnd := FALSE; started := FALSE;
-      Buffer.Read(r, ch);
-      WHILE ~r.eot & (p < cur) DO
-        IF ~started & ~isSpace(ch) THEN
-          lastStart := p; started := TRUE
-        ELSIF pendingEnd & ~isSpace(ch) THEN
-          lastStart := p
-        END;
-        IF isSentEnd(ch) THEN pendingEnd := TRUE
-        ELSIF ~isSpace(ch) THEN pendingEnd := FALSE
-        END;
-        INC(p);
-        Buffer.Read(r, ch)
-      END;
-      cur := lastStart
-    END
-  END MoveSentBackward;
-
-  PROCEDURE MoveBufStart;
-  BEGIN cur := 0
-  END MoveBufStart;
-
-  PROCEDURE MoveBufEnd;
-  BEGIN cur := buf.len
-  END MoveBufEnd;
-
-  PROCEDURE MovePageUp;
-    VAR i, viewportRows: INTEGER;
-  BEGIN
-    viewportRows := TUI.Rows - 2;
-    i := 0;
-    WHILE i < viewportRows DO MoveUp; INC(i) END
-  END MovePageUp;
-
-  PROCEDURE MovePageDown;
-    VAR i, viewportRows: INTEGER;
-  BEGIN
-    viewportRows := TUI.Rows - 2;
-    i := 0;
-    WHILE i < viewportRows DO MoveDown; INC(i) END
-  END MovePageDown;
 
   (* ---------------- scrolling ---------------- *)
 
@@ -562,7 +215,7 @@ MODULE Oed;
         Project.ResolveColl(refPath, physPath);
         data := Viewers.FindByDocName(physPath);
         IF data = NIL THEN
-          CopyStr(nm, physPath);
+          Strings.Copy(nm, physPath);
           d := Doc.New(nm);
           Buffer.Load(d.buf, physPath, res);
           Lines.Invalidate(d.lines);
@@ -577,75 +230,6 @@ MODULE Oed;
       END
     END
   END loadViewData;
-
-  (* Save without any checks. Used after the directory pre-flight
-     in DoSave has confirmed the target dir exists (or just created
-     it on the user's behalf). *)
-  PROCEDURE writeFile;
-    VAR res: INTEGER;
-  BEGIN
-    Buffer.Save(buf, name, res);
-    IF res = Buffer.Ok THEN SetStatus("Saved")
-    ELSE SetStatus("Save failed")
-    END
-  END writeFile;
-
-  (* Pre-flight check: if the target directory of `name` doesn't
-     exist, offer to create it. Otherwise the underlying
-     Files.Register would fail and Buffer.Save now leaves
-     b.changed = TRUE so the user gets the discard prompt on quit. *)
-  PROCEDURE DoSave;
-    VAR dir: ARRAY NameLen OF CHAR;
-        msg: ARRAY 192 OF CHAR;
-        res: INTEGER;
-  BEGIN
-    DirOf(name, dir);
-    IF (dir[0] # 0X) & (Files.Exists(dir) = 0) THEN
-      CopyStr(msg, "Directory '");
-      AppendStr(msg, dir);
-      AppendStr(msg, "' does not exist. Create? (y/n) ");
-      IF Mini.Confirm(msg) THEN
-        Files.MakeDir(dir, res);
-        IF res = 0 THEN
-          writeFile
-        ELSE
-          SetStatus("Could not create directory")
-        END
-      ELSE
-        SetStatus("Save cancelled — directory missing")
-      END
-    ELSE
-      writeFile
-    END
-  END DoSave;
-
-  PROCEDURE PromptSaveAs;
-    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; v: Viewers.Viewer;
-  BEGIN
-    Mini.Prompt("Save as: ", fname, ok, NIL);
-    IF ok & (fname[0] # 0X) THEN
-      CopyStr(name, fname);
-      v := Viewers.Current();
-      IF v # NIL THEN
-        CopyStr(v.doc.name, name);     (* canonical Doc name *)
-        Project.Logical(name, v.label);(* refresh display label *)
-        v.kind := Viewers.KindOf(name);(* extension may have changed *)
-        refreshSchema(v)               (* re-parse if kind became kCollection *)
-      END;
-      DoSave
-    ELSE
-      SetStatus("Save cancelled")
-    END
-  END PromptSaveAs;
-
-  PROCEDURE Save;
-  BEGIN
-    (* Buffers without a file (empty name) and "internal" buffers
-       conventionally named *foo* both need a real filename prompt. *)
-    IF (name[0] = 0X) OR (name[0] = "*") THEN PromptSaveAs
-    ELSE DoSave
-    END
-  END Save;
 
   (* ---------------- multi-viewer plumbing ---------------- *)
 
@@ -664,7 +248,7 @@ MODULE Oed;
       curCol  := v.curCol;
       leftCol := v.leftCol;
       dataDoc := v.dataDoc;
-      CopyStr(name, v.doc.name)
+      Strings.Copy(name, v.doc.name)
     END
   END attachCurrent;
 
@@ -691,8 +275,7 @@ MODULE Oed;
       Viewers.SetCurrent(target);
       attachCurrent;
       (* Yank/kill chains are buffer-local; reset on switch. *)
-      lastWasYank := FALSE;
-      lastWasKill := FALSE
+      KillRing.Reset
     END
   END switchTo;
 
@@ -709,59 +292,58 @@ MODULE Oed;
     RETURN Viewers.New(label, d, Viewers.KindOf(n))
   END makeViewer;
 
-  (* Tab-completion source for the buffer-switch prompt. Extends
-     `text` to the longest prefix shared by all viewer labels that
-     start with text[0..len-1]. *)
-  PROCEDURE bufferCompleter(VAR text: ARRAY OF CHAR; VAR len: INTEGER);
-    VAR i, k, commonLen: INTEGER;
-        v: Viewers.Viewer;
-        first, matches: BOOLEAN;
-        common: ARRAY 64 OF CHAR;
+  (* Switch wrapper used for navigation events (link follow, C-x b,
+     C-x C-f). Records the current (viewer, cur, top) onto the back
+     stack and clears the forward stack so the user can C-x , back
+     to here. Plumbing switches (kill-buffer fall-through, attach
+     after Run setup) use plain switchTo and do NOT push. *)
+  PROCEDURE navTo(target: Viewers.Viewer);
+    VAR cur0: Viewers.Viewer;
   BEGIN
-    first := TRUE; commonLen := 0;
-    i := 0;
-    WHILE i < Viewers.Count() DO
-      v := Viewers.At(i);
-      (* prefix match: v.label[0..len-1] = text[0..len-1] *)
-      matches := TRUE;
-      k := 0;
-      WHILE matches & (k < len) DO
-        IF v.label[k] # text[k] THEN matches := FALSE END;
-        INC(k)
-      END;
-      IF matches THEN
-        IF first THEN
-          CopyStr(common, v.label);
-          commonLen := 0;
-          WHILE (commonLen < LEN(common)) & (common[commonLen] # 0X) DO
-            INC(commonLen)
-          END;
-          first := FALSE
-        ELSE
-          k := 0;
-          WHILE (k < commonLen) & (common[k] = v.label[k]) DO INC(k) END;
-          commonLen := k
-        END
-      END;
-      INC(i)
+    cur0 := Viewers.Current();
+    IF (cur0 # NIL) & (target # cur0) THEN
+      History.PushNav(cur0, cur, top)
     END;
-    IF ~first & (commonLen > len) THEN
-      k := 0;
-      WHILE k < commonLen DO text[k] := common[k]; INC(k) END;
-      text[commonLen] := 0X;
-      len := commonLen
-    END
-  END bufferCompleter;
+    switchTo(target)
+  END navTo;
 
-  PROCEDURE PromptSwitchBuffer;
-    VAR n: ARRAY NameLen OF CHAR; ok: BOOLEAN;
-        target: Viewers.Viewer;
+  PROCEDURE goBack;
+    VAR v, currV: Viewers.Viewer; savedCur, savedTop: INTEGER;
   BEGIN
-    Mini.Prompt("Switch to buffer: ", n, ok, bufferCompleter);
-    IF ok & (n[0] # 0X) THEN
+    currV := Viewers.Current();
+    IF History.Back(currV, cur, top, v, savedCur, savedTop) THEN
+      v.cur := savedCur;
+      v.top := savedTop;
+      switchTo(v);
+      SetStatus("Back")
+    ELSE
+      SetStatus("No prior location")
+    END
+  END goBack;
+
+  PROCEDURE goForward;
+    VAR v, currV: Viewers.Viewer; savedCur, savedTop: INTEGER;
+  BEGIN
+    currV := Viewers.Current();
+    IF History.Forward(currV, cur, top, v, savedCur, savedTop) THEN
+      v.cur := savedCur;
+      v.top := savedTop;
+      switchTo(v);
+      SetStatus("Forward")
+    ELSE
+      SetStatus("No forward location")
+    END
+  END goForward;
+
+  PROCEDURE switchBufferDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR target: Viewers.Viewer;
+        n: ARRAY NameLen OF CHAR;
+  BEGIN
+    IF ok & (result[0] # 0X) THEN
+      Strings.Copy(n, result);
       target := Viewers.Find(n);
       IF target # NIL THEN
-        switchTo(target);
+        navTo(target);
         SetStatus("Switched")
       ELSE
         SetStatus("No such buffer")
@@ -769,147 +351,72 @@ MODULE Oed;
     ELSE
       SetStatus("Switch cancelled")
     END
+  END switchBufferDone;
+
+  PROCEDURE PromptSwitchBuffer;
+  BEGIN
+    Mini.Prompt("Switch to buffer: ", BufList.Completer, switchBufferDone)
   END PromptSwitchBuffer;
+
+  PROCEDURE killBufferConfirmDone(ok: BOOLEAN);
+    VAR scratchName: ARRAY NameLen OF CHAR; scratch: Viewers.Viewer;
+  BEGIN
+    IF ok THEN
+      IF pendingKillTarget = Viewers.Current() THEN detachCurrent END;
+      Viewers.Kill(pendingKillTarget);
+      IF Viewers.Count() = 0 THEN
+        Strings.Copy(scratchName, "*scratch*");
+        scratch := makeViewer(scratchName);
+        Viewers.Add(scratch);
+        Viewers.SetCurrent(scratch)
+      END;
+      attachCurrent;
+      KillRing.Reset;
+      SetStatus("Buffer killed")
+    ELSE
+      SetStatus("Kill cancelled")
+    END;
+    pendingKillTarget := NIL
+  END killBufferConfirmDone;
+
+  PROCEDURE killBufferPromptDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR n: ARRAY NameLen OF CHAR;
+  BEGIN
+    IF ~ok THEN
+      SetStatus("Kill cancelled")
+    ELSE
+      IF result[0] = 0X THEN
+        pendingKillTarget := Viewers.Current()
+      ELSE
+        Strings.Copy(n, result);
+        pendingKillTarget := Viewers.Find(n)
+      END;
+      IF pendingKillTarget = NIL THEN
+        SetStatus("No such buffer")
+      ELSIF pendingKillTarget.doc.buf.changed THEN
+        Mini.Confirm("Buffer modified. Kill anyway? (y/n) ",
+                     killBufferConfirmDone)
+      ELSE
+        killBufferConfirmDone(TRUE)
+      END
+    END
+  END killBufferPromptDone;
 
   PROCEDURE PromptKillBuffer;
   (* Empty input kills the current buffer. Confirms before discarding
      unsaved changes. After kill, the registry's new current becomes
      active; if the registry is empty, a fresh *scratch* takes over. *)
-    VAR n, scratchName: ARRAY NameLen OF CHAR;
-        ok, killing: BOOLEAN;
-        target, scratch: Viewers.Viewer;
   BEGIN
-    Mini.Prompt("Kill buffer: ", n, ok, bufferCompleter);
-    IF ok THEN
-      IF n[0] = 0X THEN target := Viewers.Current()
-      ELSE target := Viewers.Find(n)
-      END;
-      IF target = NIL THEN
-        SetStatus("No such buffer")
-      ELSE
-        killing := TRUE;
-        IF target.doc.buf.changed THEN
-          killing := Mini.Confirm("Buffer modified. Kill anyway? (y/n) ")
-        END;
-        IF killing THEN
-          IF target = Viewers.Current() THEN detachCurrent END;
-          Viewers.Kill(target);
-          IF Viewers.Count() = 0 THEN
-            CopyStr(scratchName, "*scratch*");
-            scratch := makeViewer(scratchName);
-            Viewers.Add(scratch);
-            Viewers.SetCurrent(scratch)
-          END;
-          attachCurrent;
-          lastWasYank := FALSE; lastWasKill := FALSE;
-          SetStatus("Buffer killed")
-        ELSE
-          SetStatus("Kill cancelled")
-        END
-      END
-    ELSE
-      SetStatus("Kill cancelled")
-    END
+    Mini.Prompt("Kill buffer: ", BufList.Completer, killBufferPromptDone)
   END PromptKillBuffer;
 
-  (* Decimal int → string. Right-pads result with NUL. *)
-  PROCEDURE IntStr(n: INTEGER; VAR s: ARRAY OF CHAR);
-    VAR digits: ARRAY 16 OF CHAR; i, j: INTEGER; ch: CHAR;
-  BEGIN
-    IF n < 0 THEN n := -n END;
-    IF n = 0 THEN
-      s[0] := "0"; s[1] := 0X
-    ELSE
-      i := 0;
-      WHILE n > 0 DO
-        ch := CHR(ORD("0") + n MOD 10);
-        digits[i] := ch;
-        n := n DIV 10;
-        INC(i)
-      END;
-      j := 0;
-      WHILE i > 0 DO
-        DEC(i);
-        s[j] := digits[i];
-        INC(j)
-      END;
-      s[j] := 0X
-    END
-  END IntStr;
-
-  (* Append literal bytes from s to b at pos, advancing pos. *)
-  PROCEDURE appendBytes(b: Buffer.Buffer; VAR pos: INTEGER; s: ARRAY OF CHAR);
-    VAR k: INTEGER;
-  BEGIN
-    k := 0;
-    WHILE (k < LEN(s)) & (s[k] # 0X) DO
-      Buffer.Insert(b, pos, s[k]); INC(pos); INC(k)
-    END
-  END appendBytes;
-
-  PROCEDURE kindName(k: INTEGER; VAR s: ARRAY OF CHAR);
-  (* Short label for Viewer.kind, used in the *viewers* table. *)
-  BEGIN
-    IF    k = Viewers.KText            THEN CopyStr(s, "text")
-    ELSIF k = Viewers.KCollection      THEN CopyStr(s, "coll")
-    ELSIF k = Viewers.KTableView       THEN CopyStr(s, "table")
-    ELSIF k = Viewers.KSpreadsheetView THEN CopyStr(s, "sheet")
-    ELSIF k = Viewers.KFormView        THEN CopyStr(s, "form")
-    ELSIF k = Viewers.KViewerList      THEN CopyStr(s, "list")
-    ELSE                                    CopyStr(s, "?")
-    END
-  END kindName;
-
-  (* (Re)populate the *viewers* synthetic Doc with one CSV row per
-     registered Viewer, behind a small @column header that drives
-     the table layout. The Doc is owned by the *viewers* Viewer
-     (`listV` below); its bytes are regenerated on every Refresh
-     while *viewers* is current, so the listing always reflects the
-     registry's current state. *)
-  PROCEDURE rebuildViewersDoc(d: Doc.Doc);
-    VAR pos, i: INTEGER;
-        v: Viewers.Viewer;
-        sizeStr, kStr: ARRAY 16 OF CHAR;
-  BEGIN
-    Buffer.Delete(d.buf, 0, d.buf.len);
-    pos := 0;
-    appendBytes(d.buf, pos, "@column(label, 32)");
-    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
-    appendBytes(d.buf, pos, "@column(kind, 6)");
-    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
-    appendBytes(d.buf, pos, "@column(size, 6)");
-    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
-    appendBytes(d.buf, pos, "@column(dirty, 2)");
-    Buffer.Insert(d.buf, pos, 0AX); INC(pos);
-
-    i := 0;
-    WHILE i < Viewers.Count() DO
-      v := Viewers.At(i);
-      Csv.WriteField(d.buf, pos, v.label); Csv.WriteSep(d.buf, pos);
-      kindName(v.kind, kStr);
-      Csv.WriteField(d.buf, pos, kStr);    Csv.WriteSep(d.buf, pos);
-      IntStr(v.doc.buf.len, sizeStr);
-      Csv.WriteField(d.buf, pos, sizeStr); Csv.WriteSep(d.buf, pos);
-      IF v.doc.buf.changed THEN Csv.WriteField(d.buf, pos, "*")
-      ELSE Csv.WriteField(d.buf, pos, "")
-      END;
-      Csv.EndRow(d.buf, pos);
-      INC(i)
-    END;
-
-    Lines.Invalidate(d.lines);
-    d.buf.changed := FALSE;
-    IF d.schema = NIL THEN d.schema := Schema.New() END;
-    Schema.Parse(d.buf, d.schema)
-  END rebuildViewersDoc;
-
-  PROCEDURE ensureViewersList(): Viewers.Viewer;
   (* Find or create the *viewers* listing viewer; kind is forced to
      KViewerList and dataDoc points at itself so TableView.Render
      can walk the embedded CSV directly. *)
+  PROCEDURE ensureViewersList(): Viewers.Viewer;
     VAR v: Viewers.Viewer; nm: ARRAY NameLen OF CHAR;
   BEGIN
-    CopyStr(nm, "*viewers*");
+    Strings.Copy(nm, "*viewers*");
     v := Viewers.Find(nm);
     IF v = NIL THEN
       v := makeViewer(nm);
@@ -926,52 +433,18 @@ MODULE Oed;
     VAR v: Viewers.Viewer;
   BEGIN
     v := ensureViewersList();
-    rebuildViewersDoc(v.doc);
+    BufList.Rebuild(v.doc);
     v.cur := 0; v.top := 0; v.curCol := 0;
     switchTo(v);
     SetStatus("Viewer list — Enter to switch, k to kill")
   END ListBuffers;
 
-  (* C-x s: save every dirty buffer that has a real filename. Skips
-     internal/*-named buffers and any with no name. Reports the
-     count, plus any failures. *)
-  PROCEDURE SaveAll;
-    VAR i, saved, failed, res: INTEGER;
-        v: Viewers.Viewer;
-        msg: ARRAY 96 OF CHAR;
-        countStr: ARRAY 16 OF CHAR;
+  PROCEDURE openDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR target: Viewers.Viewer; res: INTEGER;
+        fname: ARRAY NameLen OF CHAR;
   BEGIN
-    detachCurrent;          (* flush cur/top/mark to current Viewer *)
-    saved := 0; failed := 0;
-    i := 0;
-    WHILE i < Viewers.Count() DO
-      v := Viewers.At(i);
-      IF v.doc.buf.changed & (v.doc.name[0] # 0X) & (v.doc.name[0] # "*") THEN
-        Buffer.Save(v.doc.buf, v.doc.name, res);
-        IF res = Buffer.Ok THEN INC(saved) ELSE INC(failed) END
-      END;
-      INC(i)
-    END;
-    CopyStr(msg, "Saved ");
-    IntStr(saved, countStr); AppendStr(msg, countStr);
-    IF failed > 0 THEN
-      AppendStr(msg, ", ");
-      IntStr(failed, countStr); AppendStr(msg, countStr);
-      AppendStr(msg, " failed")
-    END;
-    SetStatus(msg)
-  END SaveAll;
-
-  PROCEDURE PromptOpen;
-  (* Open creates a new Viewer (and Doc) for the file, or switches to
-     an existing Viewer already visiting that filename. Current
-     buffer's unsaved changes are preserved — they stay in their
-     existing Viewer/Doc, just no longer the active one. *)
-    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; res: INTEGER;
-        target: Viewers.Viewer;
-  BEGIN
-    Mini.Prompt("Open: ", fname, ok, NIL);
-    IF ok & (fname[0] # 0X) THEN
+    IF ok & (result[0] # 0X) THEN
+      Strings.Copy(fname, result);
       target := Viewers.FindByDocName(fname);
       IF target = NIL THEN
         target := makeViewer(fname);
@@ -987,24 +460,30 @@ MODULE Oed;
       ELSE
         SetStatus("Switched to existing buffer")
       END;
-      switchTo(target)
+      navTo(target)
     ELSE
       SetStatus("Open cancelled")
     END
+  END openDone;
+
+  PROCEDURE PromptOpen;
+  (* Open creates a new Viewer (and Doc) for the file, or switches to
+     an existing Viewer already visiting that filename. Current
+     buffer's unsaved changes are preserved — they stay in their
+     existing Viewer/Doc, just no longer the active one. *)
+  BEGIN
+    Mini.Prompt("Open: ", NIL, openDone);
+    Mini.SetTabHandler(launchFileBrowser)
   END PromptOpen;
 
-  PROCEDURE PromptOpenRawText;
-  (* C-x C-r: open as raw text regardless of extension. If a Doc for
-     the path is already loaded by another (structured) Viewer, share
-     the Doc and create a sibling kText Viewer with a "<text>" suffix
-     in its label so the buffer list distinguishes the two. If the
-     existing Viewer is already kText we just switch to it. *)
-    VAR fname: ARRAY NameLen OF CHAR; ok: BOOLEAN; res: INTEGER;
-        target, existing: Viewers.Viewer;
+  PROCEDURE openTextDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR target, existing: Viewers.Viewer;
         textLabel: ARRAY 96 OF CHAR;
+        fname: ARRAY NameLen OF CHAR;
+        res: INTEGER;
   BEGIN
-    Mini.Prompt("Find file as text: ", fname, ok, NIL);
-    IF ok & (fname[0] # 0X) THEN
+    IF ok & (result[0] # 0X) THEN
+      Strings.Copy(fname, result);
       existing := Viewers.FindByDocName(fname);
       IF existing = NIL THEN
         Project.Logical(fname, textLabel);
@@ -1016,115 +495,105 @@ MODULE Oed;
         ELSIF res = Buffer.NotFound THEN SetStatus("(new file)")
         ELSE SetStatus("Open failed")
         END;
-        switchTo(target)
+        navTo(target)
       ELSIF existing.kind = Viewers.KText THEN
-        switchTo(existing);
+        navTo(existing);
         SetStatus("Switched to existing buffer")
       ELSE
         Project.Logical(existing.doc.name, textLabel);
-        AppendStr(textLabel, "<text>");
+        Strings.Append(textLabel, "<text>");
         target := Viewers.Find(textLabel);
         IF target = NIL THEN
           target := Viewers.New(textLabel, existing.doc, Viewers.KText);
           Viewers.Add(target)
         END;
-        switchTo(target);
+        navTo(target);
         SetStatus("Opened as text")
       END
     ELSE
       SetStatus("Open cancelled")
     END
+  END openTextDone;
+
+  PROCEDURE PromptOpenRawText;
+  (* C-x C-r: open as raw text regardless of extension. If a Doc for
+     the path is already loaded by another (structured) Viewer, share
+     the Doc and create a sibling kText Viewer with a "<text>" suffix
+     in its label so the buffer list distinguishes the two. If the
+     existing Viewer is already kText we just switch to it. *)
+  BEGIN
+    Mini.Prompt("Find file as text: ", NIL, openTextDone);
+    Mini.SetTabHandler(launchFileBrowser)
   END PromptOpenRawText;
 
-  (* ---------------- rendering ---------------- *)
+  (* ---------------- save chain ---------------- *)
 
-  (* Peek the byte length of the unbroken run of non-whitespace
-     starting at startPos. Used by the word-wrap renderer to decide
-     whether the upcoming word fits on the current screen row. *)
-  PROCEDURE peekWordLen(b: Buffer.Buffer; startPos: INTEGER): INTEGER;
-    VAR r2: Buffer.Reader; ch: CHAR; n: INTEGER;
+  PROCEDURE saveDirConfirmDone(ok: BOOLEAN);
+    VAR res: INTEGER;
   BEGIN
-    Buffer.OpenReader(r2, b, startPos);
-    n := 0;
-    Buffer.Read(r2, ch);
-    WHILE ~r2.eot & (ch # Newline) & (ch # " ") & (ch # 9X) DO
-      INC(n); Buffer.Read(r2, ch)
-    END;
-    RETURN n
-  END peekWordLen;
-
-  (* Word-wrap renderer for text-like Docs (kText / kCollection /
-     anything else that ends up in this branch). Walks bytes from
-     `top` (the start of a logical line), emits them with screen-row
-     advancement when a word would otherwise overflow TUI.Cols.
-     Logical newlines flush to the next screen row regardless. *)
-  PROCEDURE DrawBufferAndLocateCursor(VAR cursRow, cursCol: INTEGER);
-    VAR r: Buffer.Reader; ch: CHAR;
-        pos, row, col, viewportRows, wordLen, j: INTEGER;
-        done: BOOLEAN;
-  BEGIN
-    viewportRows := TUI.Rows - 2;
-    IF viewportRows < 1 THEN viewportRows := 1 END;
-    Buffer.OpenReader(r, buf, top);
-    pos := top; row := 0; col := 0;
-    cursRow := 0; cursCol := 0;
-    done := FALSE;
-    TUI.MoveTo(0, 0); TUI.ClearLine;
-    Buffer.Read(r, ch);
-    WHILE ~done DO
-      IF pos = cur THEN cursRow := row; cursCol := col END;
-      IF r.eot THEN
-        done := TRUE
-      ELSIF ch = Newline THEN
-        INC(row); col := 0;
-        IF row >= viewportRows THEN
-          done := TRUE
-        ELSE
-          TUI.MoveTo(0, row); TUI.ClearLine;
-          INC(pos); Buffer.Read(r, ch)
-        END
-      ELSIF (ch = " ") OR (ch = 9X) THEN
-        IF col >= TUI.Cols THEN
-          INC(row); col := 0;
-          IF row >= viewportRows THEN done := TRUE
-          ELSE TUI.MoveTo(0, row); TUI.ClearLine
-          END
-        END;
-        IF ~done THEN
-          TUI.Write(ch); INC(col);
-          INC(pos); Buffer.Read(r, ch)
-        END
+    IF ok THEN
+      Files.MakeDir(pendingSaveDir, res);
+      IF res = 0 THEN
+        FileOps.WriteFile(buf, name, status)
       ELSE
-        (* Word-starting byte. Look ahead to see if it fits. *)
-        wordLen := peekWordLen(buf, pos);
-        IF (col > 0) & (col + wordLen > TUI.Cols) THEN
-          INC(row); col := 0;
-          IF row >= viewportRows THEN done := TRUE
-          ELSE TUI.MoveTo(0, row); TUI.ClearLine
-          END
-        END;
-        j := 0;
-        WHILE ~done & (j < wordLen) DO
-          IF pos = cur THEN cursRow := row; cursCol := col END;
-          TUI.Write(ch); INC(col);
-          IF col >= TUI.Cols THEN
-            INC(row); col := 0;
-            IF row >= viewportRows THEN done := TRUE
-            ELSE TUI.MoveTo(0, row); TUI.ClearLine
-            END
-          END;
-          INC(pos); INC(j);
-          IF ~done THEN Buffer.Read(r, ch) END
-        END
+        SetStatus("Could not create directory")
       END
-    END;
-    (* Tilde-fill remaining rows from row+1. *)
-    INC(row);
-    WHILE row < viewportRows DO
-      TUI.MoveTo(0, row); TUI.ClearLine; TUI.Write("~");
-      INC(row)
+    ELSE
+      SetStatus("Save cancelled — directory missing")
     END
-  END DrawBufferAndLocateCursor;
+  END saveDirConfirmDone;
+
+  (* Save the current buffer using `name`. If the target directory
+     doesn't exist, offers to create it via Mini.Confirm; otherwise
+     writes immediately. *)
+  PROCEDURE saveWithName;
+    VAR msg: ARRAY 192 OF CHAR;
+  BEGIN
+    Strings.DirOf(name, pendingSaveDir);
+    IF (pendingSaveDir[0] # 0X) & (Files.Exists(pendingSaveDir) = 0) THEN
+      Strings.Copy(msg, "Directory '");
+      Strings.Append(msg, pendingSaveDir);
+      Strings.Append(msg, "' does not exist. Create? (y/n) ");
+      Mini.Confirm(msg, saveDirConfirmDone)
+    ELSE
+      FileOps.WriteFile(buf, name, status)
+    END
+  END saveWithName;
+
+  PROCEDURE saveAsDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR v: Viewers.Viewer;
+  BEGIN
+    IF ok & (result[0] # 0X) THEN
+      Strings.Copy(name, result);
+      v := Viewers.Current();
+      IF v # NIL THEN
+        Strings.Copy(v.doc.name, name);
+        Project.Logical(name, v.label);
+        v.kind := Viewers.KindOf(name);
+        refreshSchema(v)
+      END;
+      saveWithName
+    ELSE
+      SetStatus("Save cancelled")
+    END
+  END saveAsDone;
+
+  PROCEDURE promptSaveAs;
+  BEGIN
+    Mini.Prompt("Save as: ", NIL, saveAsDone);
+    Mini.SetTabHandler(launchFileBrowser)
+  END promptSaveAs;
+
+  PROCEDURE saveCurrent;
+  BEGIN
+    (* Buffers without a file (empty name) and synthetic "*foo*"
+       buffers both need a real filename prompt. *)
+    IF (name[0] = 0X) OR (name[0] = "*") THEN promptSaveAs
+    ELSE saveWithName
+    END
+  END saveCurrent;
+
+  (* ---------------- rendering ---------------- *)
 
   PROCEDURE DrawStatusBar;
     VAR line, col, dummy, i: INTEGER;
@@ -1132,7 +601,12 @@ MODULE Oed;
         v: Viewers.Viewer;
   BEGIN
     TUI.MoveTo(0, TUI.Rows - 2);
-    TUI.SetAttr(TUI.AttrReverse);
+    (* Status bar: solid blue background with white text — a
+       distinct band that the eye finds immediately and doesn't
+       conflict with the buffer's normal reverse-video selection. *)
+    TUI.SetAttr(TUI.AttrNormal);
+    TUI.SetBg(TUI.ColorBlue);
+    TUI.SetFg(TUI.ColorWhite);
     TUI.WriteStr(" oed 0.1  ");
     IF name[0] = 0X THEN
       displayName := "[No File]"
@@ -1170,15 +644,10 @@ MODULE Oed;
     END;
     dummy := 0;
     WHILE dummy < TUI.Cols DO TUI.Write(" "); INC(dummy) END;
-    TUI.SetAttr(TUI.AttrNormal)
+    TUI.SetAttr(TUI.AttrNormal);
+    TUI.SetFg(TUI.ColorDefault);
+    TUI.SetBg(TUI.ColorDefault)
   END DrawStatusBar;
-
-  PROCEDURE DrawMessageLine;
-  BEGIN
-    TUI.MoveTo(0, TUI.Rows - 1);
-    TUI.ClearLine;
-    TUI.WriteStr(status)
-  END DrawMessageLine;
 
   (* Paint everything except the message line and cursor placement.
      Returns the cursor's screen position so the caller can either
@@ -1193,7 +662,7 @@ MODULE Oed;
     TUI.HideCursor;
     v := Viewers.Current();
     IF v # NIL THEN
-      IF v.kind = Viewers.KViewerList THEN rebuildViewersDoc(v.doc) END
+      IF v.kind = Viewers.KViewerList THEN BufList.Rebuild(v.doc) END
     END;
     IF (v # NIL)
         & ((v.kind = Viewers.KTableView) OR (v.kind = Viewers.KViewerList)) THEN
@@ -1212,117 +681,82 @@ MODULE Oed;
                              top, leftCol, cur, curCol, TUI.Rows - 2,
                              cursRow, cursCol)
     ELSE
-      DrawBufferAndLocateCursor(cursRow, cursCol)
+      Render.DrawBuffer(buf, top, cur, cursRow, cursCol)
     END;
     DrawStatusBar
   END RefreshFrame;
 
   PROCEDURE Refresh;
     VAR cursRow, cursCol: INTEGER;
+        pathBuf: ARRAY 256 OF CHAR;
   BEGIN
-    RefreshFrame(cursRow, cursCol);
-    DrawMessageLine;
-    IF cursCol >= TUI.Cols THEN cursCol := TUI.Cols - 1 END;
-    TUI.MoveTo(cursCol, cursRow);
-    TUI.ShowCursor;
-    TUI.Flush
+    IF FileBrowser.Active() THEN
+      (* Browser is a modal overlay: it replaces the buffer area,
+         keeps the status bar, and writes the current selection's
+         path into the message line. *)
+      TUI.Resize;
+      TUI.HideCursor;
+      FileBrowser.Paint;
+      DrawStatusBar;
+      FileBrowser.CurrentPath(pathBuf);
+      Render.DrawMessageLine(pathBuf);
+      TUI.Flush
+    ELSE
+      RefreshFrame(cursRow, cursCol);
+      IF Mini.Active() THEN
+        Mini.Paint
+      ELSIF Search.Active() THEN
+        Search.PaintStatus;
+        IF cursCol >= TUI.Cols THEN cursCol := TUI.Cols - 1 END;
+        TUI.MoveTo(cursCol, cursRow)
+      ELSE
+        Render.DrawMessageLine(status);
+        IF cursCol >= TUI.Cols THEN cursCol := TUI.Cols - 1 END;
+        TUI.MoveTo(cursCol, cursRow)
+      END;
+      TUI.ShowCursor;
+      TUI.Flush
+    END
   END Refresh;
 
-  (* ---------------- search ---------------- *)
-
-  (* Emacs-style incremental search.
-       printable      → extend query, search from anchor
-       Ctrl-S         → forward to next match (cursor + 1)
-       Ctrl-R         → backward to previous match (before cursor)
-       Backspace/^H   → shorten query, re-search from anchor
-       Enter          → commit, leave cursor at the match
-       Esc            → cancel, restore cursor to where search started
-     The cursor sits at the END of the match while searching, so each
-     additional typed char naturally extends a continuing match. *)
-  PROCEDURE SearchInteractive(forward: BOOLEAN);
-    CONST MaxQ = 128;
-    VAR query: ARRAY MaxQ OF CHAR;
-        qLen, k, i, anchor, origCur, pos: INTEGER;
-        cursRow, cursCol: INTEGER;
-        ch: CHAR;
-        found, done, cancelled: BOOLEAN;
-  BEGIN
-    query[0] := 0X; qLen := 0;
-    origCur := cur;
-    anchor := cur;
-    found := TRUE;
-    cancelled := FALSE; done := FALSE;
-    WHILE ~done DO
-      RefreshFrame(cursRow, cursCol);
-      TUI.MoveTo(0, TUI.Rows - 1); TUI.ClearLine;
-      IF forward THEN TUI.WriteStr("I-search: ")
-      ELSE TUI.WriteStr("I-search backward: ")
-      END;
-      TUI.WriteStr(query);
-      IF ~found & (qLen > 0) THEN TUI.WriteStr("  (not found)") END;
-      IF cursCol >= TUI.Cols THEN cursCol := TUI.Cols - 1 END;
-      TUI.MoveTo(cursCol, cursRow);
-      TUI.ShowCursor;
-      TUI.Flush;
-      k := TUI.ReadKey();
-      IF k = TUI.KeyEnter THEN
-        done := TRUE
-      ELSIF k = TUI.KeyEscape THEN
-        cancelled := TRUE; done := TRUE
-      ELSIF (k = TUI.KeyBackspace) OR (k = TUI.KeyCtrlH) THEN
-        IF qLen > 0 THEN
-          DEC(qLen); query[qLen] := 0X;
-          IF qLen = 0 THEN
-            cur := anchor; found := TRUE
-          ELSE
-            IF forward THEN found := Buffer.Find(buf, anchor, query, pos)
-            ELSE found := Buffer.FindBack(buf, anchor, query, pos)
-            END;
-            IF found THEN cur := pos + qLen ELSE cur := anchor END
-          END
-        END
-      ELSIF k = TUI.KeyCtrlS THEN
-        forward := TRUE;
-        IF qLen > 0 THEN
-          (* cur sits at end of current match; searching from cur finds
-             the next non-overlapping match. *)
-          IF Buffer.Find(buf, cur, query, pos) THEN
-            found := TRUE; cur := pos + qLen
-          ELSE
-            found := FALSE
-          END
-        END
-      ELSIF k = TUI.KeyCtrlR THEN
-        forward := FALSE;
-        IF qLen > 0 THEN
-          (* cur - qLen is the current match's start; FindBack with that
-             ceiling returns the previous non-overlapping match. *)
-          IF Buffer.FindBack(buf, cur - qLen, query, pos) THEN
-            found := TRUE; cur := pos + qLen
-          ELSE
-            found := FALSE
-          END
-        END
-      ELSIF (k >= 32) & (k < 127) & (qLen < MaxQ - 1) THEN
-        ch := CHR(k);
-        query[qLen] := ch; INC(qLen); query[qLen] := 0X;
-        IF forward THEN found := Buffer.Find(buf, anchor, query, pos)
-        ELSE found := Buffer.FindBack(buf, anchor, query, pos)
-        END;
-        IF found THEN cur := pos + qLen END
-      END
-    END;
-    IF cancelled THEN
-      cur := origCur;
-      SetStatus("Search cancelled")
-    ELSIF ~found THEN
-      SetStatus("Search: not found")
-    ELSE
-      SetStatus("")
-    END
-  END SearchInteractive;
-
   (* ---------------- input ---------------- *)
+
+  (* On commit, re-resolve coll / row / dataCol from the current
+     viewer and splice. cur and curCol are frozen while the prompt
+     is up so the row/col we resolved before the prompt is still
+     the right one. *)
+  PROCEDURE editCellDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR v: Viewers.Viewer;
+        coll: Collection.Collection;
+        rowStart, dataCol: INTEGER;
+        colName: ARRAY Schema.MaxName OF CHAR;
+  BEGIN
+    IF ~ok THEN
+      SetStatus("Edit cancelled")
+    ELSE
+      v := Viewers.Current();
+      IF (v # NIL) & (v.kind = Viewers.KTableView)
+          & (v.dataDoc # NIL) & (v.doc.schema # NIL)
+          & (curCol >= 0) & (curCol < v.doc.schema.ncol) THEN
+        Strings.Copy(colName, v.doc.schema.cols[curCol].name);
+        dataCol := Schema.Find(v.dataDoc.schema, colName);
+        IF dataCol >= 0 THEN
+          coll := Collection.Open(v.dataDoc);
+          rowStart := Collection.FindRow(coll, cur);
+          IF rowStart >= 0 THEN
+            Collection.SetCell(coll, rowStart, dataCol, result);
+            SetStatus("Cell updated")
+          ELSE
+            SetStatus("Row out of range")
+          END
+        ELSE
+          SetStatus("Projection column not in data schema")
+        END
+      ELSE
+        SetStatus("Cannot edit here")
+      END
+    END
+  END editCellDone;
 
   (* Prompt for a new value for the current (cur, curCol) cell, pre-
      filled with the existing value, and on commit splice it into
@@ -1330,46 +764,34 @@ MODULE Oed;
      subsequent C-x s (or C-x C-s on the .col itself) persists. *)
   PROCEDURE EditCurrentCell;
     VAR v: Viewers.Viewer;
-        viewSch, dataSch: Schema.Schema;
         coll: Collection.Collection;
         rowStart, dataCol: INTEGER;
         colName: ARRAY Schema.MaxName OF CHAR;
-        cur0, newVal: ARRAY 256 OF CHAR;
-        ok: BOOLEAN;
+        cur0: ARRAY 256 OF CHAR;
         promptText: ARRAY 64 OF CHAR;
   BEGIN
     v := Viewers.Current();
     IF (v = NIL) OR (v.kind # Viewers.KTableView)
         OR (v.dataDoc = NIL) OR (v.doc.schema = NIL) THEN
       SetStatus("Cannot edit here")
+    ELSIF (curCol < 0) OR (curCol >= v.doc.schema.ncol) THEN
+      SetStatus("No column selected")
     ELSE
-      viewSch := v.doc.schema;
-      dataSch := v.dataDoc.schema;
-      IF (curCol < 0) OR (curCol >= viewSch.ncol) THEN
-        SetStatus("No column selected")
+      Strings.Copy(colName, v.doc.schema.cols[curCol].name);
+      dataCol := Schema.Find(v.dataDoc.schema, colName);
+      IF dataCol < 0 THEN
+        SetStatus("Projection column not in data schema")
       ELSE
-        CopyStr(colName, viewSch.cols[curCol].name);
-        dataCol := Schema.Find(dataSch, colName);
-        IF dataCol < 0 THEN
-          SetStatus("Projection column not in data schema")
+        coll := Collection.Open(v.dataDoc);
+        rowStart := Collection.FindRow(coll, cur);
+        IF rowStart < 0 THEN
+          SetStatus("Row out of range")
         ELSE
-          coll := Collection.Open(v.dataDoc);
-          rowStart := Collection.FindRow(coll, cur);
-          IF rowStart < 0 THEN
-            SetStatus("Row out of range")
-          ELSE
-            Collection.GetCell(coll, rowStart, dataCol, cur0);
-            CopyStr(promptText, "Edit ");
-            AppendStr(promptText, viewSch.cols[curCol].label);
-            AppendStr(promptText, ": ");
-            Mini.PromptEdit(promptText, cur0, newVal, ok, NIL);
-            IF ok THEN
-              Collection.SetCell(coll, rowStart, dataCol, newVal);
-              SetStatus("Cell updated")
-            ELSE
-              SetStatus("Edit cancelled")
-            END
-          END
+          Collection.GetCell(coll, rowStart, dataCol, cur0);
+          Strings.Copy(promptText, "Edit ");
+          Strings.Append(promptText, v.doc.schema.cols[curCol].label);
+          Strings.Append(promptText, ": ");
+          Mini.PromptEdit(promptText, cur0, NIL, editCellDone)
         END
       END
     END
@@ -1390,41 +812,92 @@ MODULE Oed;
     END
   END SwitchToRowViewer;
 
+  PROCEDURE killRowConfirmDone(ok: BOOLEAN);
+    VAR scratchName: ARRAY NameLen OF CHAR; scratch: Viewers.Viewer;
+  BEGIN
+    IF ok THEN
+      IF pendingRowKillTarget = Viewers.Current() THEN detachCurrent END;
+      Viewers.Kill(pendingRowKillTarget);
+      IF Viewers.Count() = 0 THEN
+        Strings.Copy(scratchName, "*scratch*");
+        scratch := makeViewer(scratchName);
+        Viewers.Add(scratch);
+        Viewers.SetCurrent(scratch)
+      END;
+      attachCurrent;
+      IF cur > 0 THEN DEC(cur) END;
+      KillRing.Reset;
+      SetStatus("Buffer killed")
+    ELSE
+      SetStatus("Kill cancelled")
+    END;
+    pendingRowKillTarget := NIL
+  END killRowConfirmDone;
+
   PROCEDURE KillRowViewer;
     VAR target: Viewers.Viewer;
-        killing: BOOLEAN;
-        scratchName: ARRAY NameLen OF CHAR;
-        scratch: Viewers.Viewer;
   BEGIN
     target := Viewers.At(cur);
-    IF target = NIL THEN SetStatus("No such row")
+    IF target = NIL THEN
+      SetStatus("No such row")
+    ELSIF target.doc.buf.changed THEN
+      pendingRowKillTarget := target;
+      Mini.Confirm("Buffer modified. Kill anyway? (y/n) ",
+                   killRowConfirmDone)
     ELSE
-      killing := TRUE;
-      IF target.doc.buf.changed THEN
-        killing := Mini.Confirm("Buffer modified. Kill anyway? (y/n) ")
-      END;
-      IF killing THEN
-        IF target = Viewers.Current() THEN detachCurrent END;
-        Viewers.Kill(target);
-        IF Viewers.Count() = 0 THEN
-          CopyStr(scratchName, "*scratch*");
-          scratch := makeViewer(scratchName);
-          Viewers.Add(scratch);
-          Viewers.SetCurrent(scratch)
-        END;
-        attachCurrent;
-        IF cur > 0 THEN DEC(cur) END;
-        lastWasYank := FALSE; lastWasKill := FALSE;
-        SetStatus("Buffer killed")
-      ELSE
-        SetStatus("Kill cancelled")
-      END
+      pendingRowKillTarget := target;
+      killRowConfirmDone(TRUE)
     END
   END KillRowViewer;
 
+  (* First open kFormView whose dataDoc matches d, or NIL. Used by
+     the table-row → form Enter binding to find the card to show. *)
+  PROCEDURE findFormFor(d: Doc.Doc): Viewers.Viewer;
+    VAR i: INTEGER; v, found: Viewers.Viewer;
+  BEGIN
+    found := NIL; i := 0;
+    WHILE (i < Viewers.Count()) & (found = NIL) DO
+      v := Viewers.At(i);
+      IF (v.kind = Viewers.KFormView) & (v.dataDoc = d) THEN
+        found := v
+      END;
+      INC(i)
+    END;
+    RETURN found
+  END findFormFor;
+
+  (* Jump from the current table / collection row to the matching
+     form's record. Pushes navigation history so C-x , returns to
+     the table at the same row. The form's `top` is its current
+     record index, so we set it to cur (which is the row index in
+     kTableView / kCollection). *)
+  PROCEDURE jumpToForm;
+    VAR v, form: Viewers.Viewer; collDoc: Doc.Doc;
+  BEGIN
+    v := Viewers.Current();
+    collDoc := NIL;
+    IF v # NIL THEN
+      IF v.kind = Viewers.KTableView THEN collDoc := v.dataDoc
+      ELSIF v.kind = Viewers.KCollection THEN collDoc := v.doc
+      END
+    END;
+    IF collDoc = NIL THEN
+      SetStatus("No collection here to jump from")
+    ELSE
+      form := findFormFor(collDoc);
+      IF form = NIL THEN
+        SetStatus("No form view open for this collection — open one with C-x C-f")
+      ELSE
+        form.top := cur;
+        navTo(form)
+      END
+    END
+  END jumpToForm;
+
   (* Navigation for a kTableView. cur is the row index, top is the
-     top visible row, curCol the column. Read-only motion for now;
-     Enter opens an in-place edit (EditCurrentCell). For
+     top visible row, curCol the column. Read-only motion;
+     Enter jumps to the matching kFormView record (history-pushed
+     so C-x , returns), C-x e edits the cell at point. For
      KViewerList, Enter switches to the row's viewer and k kills
      it. *)
   PROCEDURE TableEntryKey(k: INTEGER);
@@ -1440,7 +913,7 @@ MODULE Oed;
     IF viewportRows < 1 THEN viewportRows := 1 END;
     IF k = TUI.KeyCtrlX THEN
       mode := ModeCommand;
-      SetStatus("Ctrl-X: Ctrl-S save, Ctrl-W save-as, Ctrl-F open, Ctrl-C quit")
+      SetStatus("Ctrl-X: Ctrl-S save, Ctrl-W save-as, e edit, Ctrl-C quit")
     ELSIF (k = TUI.KeyArrowLeft) OR (k = TUI.KeyCtrlB) THEN
       IF curCol > 0 THEN DEC(curCol) END; SetStatus("")
     ELSIF (k = TUI.KeyArrowRight) OR (k = TUI.KeyCtrlF) THEN
@@ -1472,7 +945,7 @@ MODULE Oed;
       IF v.kind = Viewers.KViewerList THEN
         SwitchToRowViewer
       ELSE
-        EditCurrentCell
+        jumpToForm
       END
     ELSIF (k = ORD("k")) & (v.kind = Viewers.KViewerList) THEN
       KillRowViewer
@@ -1480,23 +953,59 @@ MODULE Oed;
       IF v.kind = Viewers.KViewerList THEN
         SetStatus("Enter switches to viewer, k kills it")
       ELSE
-        SetStatus("Press Enter to edit")
+        SetStatus("Enter form, C-x e edit, C-x , back")
       END
     END
   END TableEntryKey;
 
+  PROCEDURE editFieldDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR v: Viewers.Viewer;
+        fl: FormView.Layout;
+        coll: Collection.Collection;
+        rowStart, dataCol: INTEGER;
+        fname: ARRAY FormView.MaxFieldName OF CHAR;
+  BEGIN
+    IF ~ok THEN
+      SetStatus("Edit cancelled")
+    ELSE
+      v := Viewers.Current();
+      IF (v # NIL) & (v.kind = Viewers.KFormView)
+          & (v.dataDoc # NIL) & (v.dataDoc.schema # NIL) THEN
+        FormView.CollectFields(v.doc, fl);
+        IF (cur >= 0) & (cur < fl.n) THEN
+          Strings.Copy(fname, fl.fields[cur].name);
+          dataCol := Schema.Find(v.dataDoc.schema, fname);
+          IF dataCol >= 0 THEN
+            coll := Collection.Open(v.dataDoc);
+            rowStart := Collection.FindRow(coll, top);
+            IF rowStart >= 0 THEN
+              Collection.SetCell(coll, rowStart, dataCol, result);
+              SetStatus("Field updated")
+            ELSE
+              SetStatus("Record out of range")
+            END
+          ELSE
+            SetStatus("Field not in data schema")
+          END
+        ELSE
+          SetStatus("No field selected")
+        END
+      ELSE
+        SetStatus("Cannot edit here")
+      END
+    END
+  END editFieldDone;
+
   (* Prompt for a new value for the current form field at the
-     current record, pre-filled with its existing value. On commit,
-     Collection.SetCell writes it back. *)
+     current record, pre-filled with its existing value. *)
   PROCEDURE EditCurrentField;
     VAR v: Viewers.Viewer;
         fl: FormView.Layout;
         coll: Collection.Collection;
         rowStart, dataCol: INTEGER;
-        cur0, newVal: ARRAY 256 OF CHAR;
-        ok: BOOLEAN;
+        cur0: ARRAY 256 OF CHAR;
         promptText: ARRAY 64 OF CHAR;
-        name: ARRAY FormView.MaxFieldName OF CHAR;
+        fname: ARRAY FormView.MaxFieldName OF CHAR;
   BEGIN
     v := Viewers.Current();
     IF (v = NIL) OR (v.kind # Viewers.KFormView)
@@ -1507,8 +1016,8 @@ MODULE Oed;
       IF (cur < 0) OR (cur >= fl.n) THEN
         SetStatus("No field selected")
       ELSE
-        CopyStr(name, fl.fields[cur].name);
-        dataCol := Schema.Find(v.dataDoc.schema, name);
+        Strings.Copy(fname, fl.fields[cur].name);
+        dataCol := Schema.Find(v.dataDoc.schema, fname);
         IF dataCol < 0 THEN
           SetStatus("Field not in data schema")
         ELSE
@@ -1518,16 +1027,10 @@ MODULE Oed;
             SetStatus("Record out of range")
           ELSE
             Collection.GetCell(coll, rowStart, dataCol, cur0);
-            CopyStr(promptText, "Edit ");
-            AppendStr(promptText, name);
-            AppendStr(promptText, ": ");
-            Mini.PromptEdit(promptText, cur0, newVal, ok, NIL);
-            IF ok THEN
-              Collection.SetCell(coll, rowStart, dataCol, newVal);
-              SetStatus("Field updated")
-            ELSE
-              SetStatus("Edit cancelled")
-            END
+            Strings.Copy(promptText, "Edit ");
+            Strings.Append(promptText, fname);
+            Strings.Append(promptText, ": ");
+            Mini.PromptEdit(promptText, cur0, NIL, editFieldDone)
           END
         END
       END
@@ -1591,7 +1094,7 @@ MODULE Oed;
       found := FALSE; i := 0;
       WHILE (i < cells.n) & ~found DO
         IF (cells.cells[i].col = curCol) & (cells.cells[i].row = cur) THEN
-          CopyStr(txt, cells.cells[i].formula);
+          Strings.Copy(txt, cells.cells[i].formula);
           found := TRUE
         END;
         INC(i)
@@ -1618,34 +1121,20 @@ MODULE Oed;
          with empty rows if needed.
        - empty new value → clears the cell on whichever side it
          currently lives. *)
-  PROCEDURE EditSpreadsheetCell;
+  PROCEDURE editSpreadsheetDone(result: ARRAY OF CHAR; ok: BOOLEAN);
     VAR v: Viewers.Viewer;
         coll: Collection.Collection;
         rowStart, dataCols: INTEGER;
-        cur0, newVal: ARRAY 256 OF CHAR;
-        ok: BOOLEAN;
-        promptText: ARRAY 64 OF CHAR;
-        coord: ARRAY 8 OF CHAR;
-        rowStr: ARRAY 8 OF CHAR;
   BEGIN
-    v := Viewers.Current();
-    IF (v = NIL) OR (v.kind # Viewers.KSpreadsheetView)
-        OR (v.dataDoc = NIL) OR (v.dataDoc.schema = NIL) THEN
-      SetStatus("Cannot edit here")
+    IF ~ok THEN
+      SetStatus("Edit cancelled")
     ELSE
-      dataCols := v.dataDoc.schema.ncol;
-      currentSpreadsheetText(cur0);
-      coord[0] := CHR(ORD("A") + curCol); coord[1] := 0X;
-      IntStr(cur + 1, rowStr);
-      CopyStr(promptText, "Edit ");
-      AppendStr(promptText, coord);
-      AppendStr(promptText, rowStr);
-      AppendStr(promptText, ": ");
-      Mini.PromptEdit(promptText, cur0, newVal, ok, NIL);
-      IF ok THEN
-        IF newVal[0] = "=" THEN
-          (* Formulas can live in any cell — no data-column restriction. *)
-          SpreadsheetView.SetFormula(v.doc, curCol, cur, newVal);
+      v := Viewers.Current();
+      IF (v # NIL) & (v.kind = Viewers.KSpreadsheetView)
+          & (v.dataDoc # NIL) & (v.dataDoc.schema # NIL) THEN
+        dataCols := v.dataDoc.schema.ncol;
+        IF result[0] = "=" THEN
+          SpreadsheetView.SetFormula(v.doc, curCol, cur, result);
           SetStatus("Formula stored")
         ELSIF (curCol < 0) OR (curCol >= dataCols) THEN
           SetStatus("Column out of data range (use = for formulas)")
@@ -1657,13 +1146,36 @@ MODULE Oed;
           IF rowStart < 0 THEN
             SetStatus("Failed to extend data")
           ELSE
-            Collection.SetCell(coll, rowStart, curCol, newVal);
+            Collection.SetCell(coll, rowStart, curCol, result);
             SetStatus("Value stored")
           END
         END
       ELSE
-        SetStatus("Edit cancelled")
+        SetStatus("Cannot edit here")
       END
+    END
+  END editSpreadsheetDone;
+
+  PROCEDURE EditSpreadsheetCell;
+    VAR v: Viewers.Viewer;
+        cur0: ARRAY 256 OF CHAR;
+        promptText: ARRAY 64 OF CHAR;
+        coord: ARRAY 8 OF CHAR;
+        rowStr: ARRAY 8 OF CHAR;
+  BEGIN
+    v := Viewers.Current();
+    IF (v = NIL) OR (v.kind # Viewers.KSpreadsheetView)
+        OR (v.dataDoc = NIL) OR (v.dataDoc.schema = NIL) THEN
+      SetStatus("Cannot edit here")
+    ELSE
+      currentSpreadsheetText(cur0);
+      coord[0] := CHR(ORD("A") + curCol); coord[1] := 0X;
+      Strings.IntStr(cur + 1, rowStr);
+      Strings.Copy(promptText, "Edit ");
+      Strings.Append(promptText, coord);
+      Strings.Append(promptText, rowStr);
+      Strings.Append(promptText, ": ");
+      Mini.PromptEdit(promptText, cur0, NIL, editSpreadsheetDone)
     END
   END EditSpreadsheetCell;
 
@@ -1701,7 +1213,7 @@ MODULE Oed;
         SpreadsheetView.SetFormat(v.doc, curCol, cur, empty);
         SetStatus("Bold cleared")
       ELSE
-        CopyStr(bold, "bold");
+        Strings.Copy(bold, "bold");
         SpreadsheetView.SetFormat(v.doc, curCol, cur, bold);
         SetStatus("Bold set")
       END
@@ -1760,39 +1272,42 @@ MODULE Oed;
         SetStatus("Ctrl-X: Ctrl-S save, Ctrl-W save-as, Ctrl-F open, Ctrl-C quit")
     | TUI.KeyCtrlL:
         SetStatus("")
-    | TUI.KeyArrowLeft:  MoveLeft;  SetStatus("")
-    | TUI.KeyArrowRight: MoveRight; SetStatus("")
-    | TUI.KeyArrowUp:    MoveUp;    SetStatus("")
-    | TUI.KeyArrowDown:  MoveDown;  SetStatus("")
-    | TUI.KeyHome:       MoveHome;  SetStatus("")
-    | TUI.KeyEnd:        MoveEnd;   SetStatus("")
-    | TUI.KeyPageUp:     MovePageUp;   SetStatus("")
-    | TUI.KeyPageDown:   MovePageDown; SetStatus("")
-    | TUI.KeyEnter:      InsertCh(Newline); SetStatus("")
+    | TUI.KeyArrowLeft:  Motion.Left(cur);            SetStatus("")
+    | TUI.KeyArrowRight: Motion.Right(buf, cur);      SetStatus("")
+    | TUI.KeyArrowUp:    Motion.Up(lines, cur);       SetStatus("")
+    | TUI.KeyArrowDown:  Motion.Down(lines, cur);     SetStatus("")
+    | TUI.KeyHome:       Motion.Home(lines, cur);     SetStatus("")
+    | TUI.KeyEnd:        Motion.End(lines, cur);      SetStatus("")
+    | TUI.KeyPageUp:     Motion.PageUp(lines, cur, TUI.Rows - 2);   SetStatus("")
+    | TUI.KeyPageDown:   Motion.PageDown(lines, cur, TUI.Rows - 2); SetStatus("")
+    | TUI.KeyEnter:
+        IF ~Links.Follow(buf, cur, status, makeViewer, navTo) THEN
+          InsertCh(Newline); SetStatus("")
+        END
     | TUI.KeyBackspace, TUI.KeyCtrlH:
                          BackspaceCh; SetStatus("")
     | TUI.KeyDelete:     DeleteCh; SetStatus("")
-    | TUI.KeyCtrlS:      SearchInteractive(TRUE)
-    | TUI.KeyCtrlR:      SearchInteractive(FALSE)
-    | TUI.KeyCtrlA:      MoveHome;  SetStatus("")
-    | TUI.KeyCtrlB:      MoveLeft;  SetStatus("")
+    | TUI.KeyCtrlS:      Search.Begin(buf, cur, TRUE)
+    | TUI.KeyCtrlR:      Search.Begin(buf, cur, FALSE)
+    | TUI.KeyCtrlA:      Motion.Home(lines, cur);     SetStatus("")
+    | TUI.KeyCtrlB:      Motion.Left(cur);            SetStatus("")
     | TUI.KeyCtrlD:      DeleteCh;  SetStatus("")
-    | TUI.KeyCtrlE:      MoveEnd;   SetStatus("")
-    | TUI.KeyCtrlF:      MoveRight; SetStatus("")
-    | TUI.KeyCtrlN:      MoveDown;  SetStatus("")
-    | TUI.KeyCtrlP:      MoveUp;    SetStatus("")
-    | TUI.KeyMetaLT:     MoveBufStart; SetStatus("")
-    | TUI.KeyMetaGT:     MoveBufEnd;   SetStatus("")
-    | TUI.KeyMetaF:      MoveWordForward;  SetStatus("")
-    | TUI.KeyMetaB:      MoveWordBackward; SetStatus("")
-    | TUI.KeyMetaA:      MoveSentBackward; SetStatus("")
-    | TUI.KeyMetaE:      MoveSentForward;  SetStatus("")
-    | TUI.KeyCtrlSpace:  SetMark
-    | TUI.KeyCtrlW:      KillRegion
-    | TUI.KeyCtrlY:      Yank
-    | TUI.KeyMetaW:      CopyRegion
-    | TUI.KeyMetaY:      YankPop
-    | TUI.KeyCtrlK:      KillLine
+    | TUI.KeyCtrlE:      Motion.End(lines, cur);      SetStatus("")
+    | TUI.KeyCtrlF:      Motion.Right(buf, cur);      SetStatus("")
+    | TUI.KeyCtrlN:      Motion.Down(lines, cur);     SetStatus("")
+    | TUI.KeyCtrlP:      Motion.Up(lines, cur);       SetStatus("")
+    | TUI.KeyMetaLT:     Motion.BufStart(cur);        SetStatus("")
+    | TUI.KeyMetaGT:     Motion.BufEnd(buf, cur);     SetStatus("")
+    | TUI.KeyMetaF:      Motion.WordForward(buf, cur);  SetStatus("")
+    | TUI.KeyMetaB:      Motion.WordBackward(buf, cur); SetStatus("")
+    | TUI.KeyMetaA:      Motion.SentBackward(buf, cur); SetStatus("")
+    | TUI.KeyMetaE:      Motion.SentForward(buf, cur);  SetStatus("")
+    | TUI.KeyCtrlSpace:  KillRing.SetMark(cur, mark, status)
+    | TUI.KeyCtrlW:      KillRing.KillRegion(buf, lines, cur, mark, status)
+    | TUI.KeyCtrlY:      KillRing.Yank(buf, lines, cur, status)
+    | TUI.KeyMetaW:      KillRing.CopyRegion(buf, cur, mark, status)
+    | TUI.KeyMetaY:      KillRing.YankPop(buf, lines, cur, status)
+    | TUI.KeyCtrlK:      KillRing.KillLine(buf, lines, cur, status)
     ELSE
       IF (k >= 32) & (k < 127) THEN
         ch := CHR(k);
@@ -1802,8 +1317,8 @@ MODULE Oed;
         SetStatus("(unhandled key)")
       END
     END;
-    IF ~isYankCmd THEN lastWasYank := FALSE END;
-    IF ~isKillCmd THEN lastWasKill := FALSE END
+    IF ~isYankCmd THEN KillRing.ClearLastWasYank END;
+    IF ~isKillCmd THEN KillRing.ClearLastWasKill END
   END TextEntryKey;
 
   PROCEDURE EntryKey(k: INTEGER);
@@ -1838,18 +1353,113 @@ MODULE Oed;
     RETURN dirty
   END anyBufferDirty;
 
+  PROCEDURE quitConfirmDone(ok: BOOLEAN);
+  BEGIN
+    IF ok THEN running := FALSE
+    ELSE SetStatus("Quit cancelled")
+    END
+  END quitConfirmDone;
+
+  (* Edit the URL of the link at cur in place. Does NOT follow.
+     Pending uS / uE remember the bracket positions so the done
+     callback can splice the new URL without re-parsing. *)
+  PROCEDURE editLinkDone(result: ARRAY OF CHAR; ok: BOOLEAN);
+    VAR i, n: INTEGER;
+  BEGIN
+    IF ok THEN
+      Buffer.Delete(buf, pendingLinkUS, pendingLinkUE);
+      Lines.Deleted(lines, pendingLinkUS, pendingLinkUE);
+      n := 0;
+      WHILE (n < LEN(result)) & (result[n] # 0X) DO INC(n) END;
+      i := 0;
+      WHILE i < n DO
+        Buffer.Insert(buf, pendingLinkUS + i, result[i]); INC(i)
+      END;
+      IF n > 0 THEN Lines.Inserted(lines, pendingLinkUS, n) END;
+      IF cur > pendingLinkUS + n THEN cur := pendingLinkUS + n END;
+      SetStatus("URL updated")
+    ELSE
+      SetStatus("URL edit cancelled")
+    END
+  END editLinkDone;
+
+  PROCEDURE editLinkAtPoint;
+    VAR op, tE, uS, uE, urlLen, i: INTEGER;
+        url: ARRAY 256 OF CHAR;
+  BEGIN
+    IF Render.AtLink(buf, cur, op, tE, uS, uE) THEN
+      pendingLinkUS := uS; pendingLinkUE := uE;
+      urlLen := uE - uS;
+      IF urlLen > LEN(url) - 1 THEN urlLen := LEN(url) - 1 END;
+      i := 0;
+      WHILE i < urlLen DO
+        url[i] := Render.CharAt(buf, uS + i); INC(i)
+      END;
+      url[urlLen] := 0X;
+      Mini.PromptEdit("Edit URL: ", url, NIL, editLinkDone)
+    ELSE
+      SetStatus("Not on a link")
+    END
+  END editLinkAtPoint;
+
+  (* C-x e: edit the cell / field / spreadsheet cell at point. Used
+     to be Enter in tables, but Enter is now table → form jump (in
+     line with link Enter = follow). *)
+  PROCEDURE oedUndo;
+    VAR pos: INTEGER;
+  BEGIN
+    IF Buffer.Undo(buf, pos) THEN
+      Lines.Invalidate(lines);
+      cur := pos;
+      IF cur > buf.len THEN cur := buf.len END;
+      SetStatus("Undo")
+    ELSE
+      SetStatus("Nothing to undo")
+    END
+  END oedUndo;
+
+  PROCEDURE oedRedo;
+    VAR pos: INTEGER;
+  BEGIN
+    IF Buffer.Redo(buf, pos) THEN
+      Lines.Invalidate(lines);
+      cur := pos;
+      IF cur > buf.len THEN cur := buf.len END;
+      SetStatus("Redo")
+    ELSE
+      SetStatus("Nothing to redo")
+    END
+  END oedRedo;
+
+  PROCEDURE editAtPoint;
+    VAR v: Viewers.Viewer;
+  BEGIN
+    v := Viewers.Current();
+    IF v = NIL THEN
+      SetStatus("Nothing to edit")
+    ELSIF v.kind = Viewers.KTableView THEN
+      EditCurrentCell
+    ELSIF v.kind = Viewers.KFormView THEN
+      EditCurrentField
+    ELSIF v.kind = Viewers.KSpreadsheetView THEN
+      EditSpreadsheetCell
+    ELSE
+      SetStatus("No editable cell here")
+    END
+  END editAtPoint;
+
   PROCEDURE CommandKey(k: INTEGER);
   BEGIN
     IF k = TUI.KeyCtrlC THEN
-      IF ~anyBufferDirty() OR Mini.Confirm("Discard unsaved changes? (y/n) ") THEN
-        running := FALSE
+      IF anyBufferDirty() THEN
+        Mini.Confirm("Discard unsaved changes? (y/n) ", quitConfirmDone)
       ELSE
-        SetStatus("Quit cancelled")
+        running := FALSE
       END
     ELSIF k = TUI.KeyCtrlS THEN
-      Save
+      saveCurrent
     ELSIF k = TUI.KeyCtrlW THEN
-      PromptSaveAs
+      promptSaveAs
     ELSIF k = TUI.KeyCtrlF THEN
       PromptOpen
     ELSIF k = TUI.KeyCtrlR THEN
@@ -1859,23 +1469,63 @@ MODULE Oed;
     ELSIF k = ORD("k") THEN
       PromptKillBuffer
     ELSIF k = ORD("s") THEN
-      SaveAll
+      FileOps.SaveAll(status, detachCurrent)
     ELSIF k = TUI.KeyCtrlB THEN
       ListBuffers
+    ELSIF k = ORD("e") THEN
+      editAtPoint
+    ELSIF k = ORD("l") THEN
+      editLinkAtPoint
+    ELSIF k = ORD("u") THEN
+      oedUndo
+    ELSIF k = ORD("U") THEN
+      oedRedo
+    ELSIF k = ORD(",") THEN
+      goBack
+    ELSIF k = ORD(".") THEN
+      goForward
     ELSE
       SetStatus("Command cancelled")
     END;
     mode := ModeEntry
   END CommandKey;
 
-  PROCEDURE Process;
-    VAR k: INTEGER;
+  (* Per-keystroke handler used by both targets. On posix TUI.Run
+     loops, calling this for each ReadKey result; on wasm the JS
+     host invokes oc_dispatch_key per keydown event and that
+     dispatches here.
+
+     Routes keys in priority order:
+       1. Mini active   → minibuffer prompt input
+       2. Search active → incremental-search step; mirror cur back
+       3. otherwise     → editor entry / command dispatch
+     Then repaints or, if the user quit, tears down and signals
+     TUI.Run to return. *)
+  PROCEDURE handleKey(k: INTEGER);
   BEGIN
-    k := TUI.ReadKey();
-    IF mode = ModeEntry THEN EntryKey(k)
-    ELSE CommandKey(k)
+    IF FileBrowser.Active() THEN
+      FileBrowser.HandleKey(k)
+    ELSIF Mini.Active() THEN
+      Mini.HandleKey(k)
+    ELSIF Search.Active() THEN
+      Search.HandleKey(k);
+      cur := Search.Cur();
+      IF ~Search.Active() THEN Search.Status(status) END
+    ELSE
+      IF mode = ModeEntry THEN EntryKey(k)
+      ELSE CommandKey(k)
+      END
+    END;
+    IF running THEN
+      Refresh
+    ELSE
+      detachCurrent;
+      TUI.Clear;
+      TUI.Flush;
+      TUI.Shutdown;
+      TUI.Quit
     END
-  END Process;
+  END handleKey;
 
   PROCEDURE LoadInitialFile;
   (* If argv[1] was given, open it as a new Viewer (or switch to one
@@ -1922,31 +1572,22 @@ MODULE Oed;
     (* Always start with a *scratch* viewer so the editor has a
        current viewer even with no argv. argv-driven Open layers on
        top. *)
-    CopyStr(scratchName, "*scratch*");
+    Strings.Copy(scratchName, "*scratch*");
     scratch := makeViewer(scratchName);
     Viewers.Add(scratch);
     Viewers.SetCurrent(scratch);
     attachCurrent;
 
-    killHead    := 0;
-    killCount   := 0;
-    yankIndex   := 0;
-    yankStart   := 0;
-    yankLen     := 0;
-    lastWasYank := FALSE;
-    lastWasKill := FALSE;
+    KillRing.Init;
     mode        := ModeEntry;
     running     := TRUE;
     SetStatus("HELP: Ctrl-X then Ctrl-S save, Ctrl-W save-as, Ctrl-F open, b switch buffer, Ctrl-C quit");
     LoadInitialFile;
-    WHILE running DO
-      Refresh;
-      Process
-    END;
-    detachCurrent;
-    TUI.Clear;
-    TUI.Flush;
-    TUI.Shutdown
+    Refresh;                       (* paint the initial frame *)
+    TUI.SetKeyHandler(handleKey);
+    TUI.Run                        (* posix: blocks dispatching ReadKey →
+                                      handleKey; wasm: returns immediately
+                                      and JS dispatches per keydown *)
   END Run;
 
 BEGIN
