@@ -1281,7 +1281,7 @@ MODULE Oed;
     | TUI.KeyPageUp:     Motion.PageUp(lines, cur, TUI.Rows - 2);   SetStatus("")
     | TUI.KeyPageDown:   Motion.PageDown(lines, cur, TUI.Rows - 2); SetStatus("")
     | TUI.KeyEnter:
-        IF ~Links.Follow(buf, cur, status, makeViewer, navTo) THEN
+        IF ~Links.Follow(buf, cur, name, status, makeViewer, navTo) THEN
           InsertCh(Newline); SetStatus("")
         END
     | TUI.KeyBackspace, TUI.KeyCtrlH:
