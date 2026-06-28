@@ -86,13 +86,7 @@ compile_dir() {
     pushd "$dir" >/dev/null
     for m in "${names[@]}"; do
         echo "build-oberon: compile ${dir##*/}/${m}.Mod"
-        # -s forces a fresh .smb write. We always recompile every
-        # module (no input/output dependency tracking yet), and the
-        # oc compiler has a latent bug where the no-change branch
-        # leaves the .smb file's key field zeroed on disk — flipping
-        # the file hash every other run and tripping a subsequent
-        # "new symbol file inhibited" error. -s sidesteps it.
-        "$OC" -target "$TRIPLE" -s "${m}.Mod"
+        "$OC" -target "$TRIPLE" "${m}.Mod"
     done
     popd >/dev/null
 }
