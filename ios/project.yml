@@ -1,0 +1,47 @@
+name: Oed
+options:
+  bundleIdPrefix: com.1av
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+packages:
+  OberonTUI:
+    # The compiler repo ships the generic iOS host as a Swift Package
+    # at oc/ios/. Sibling-checkout assumed; override via OC_IOS_PATH
+    # if you keep the repos elsewhere.
+    path: ../../oc/ios
+
+targets:
+  Oed:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/Oed
+      - path: Resources
+    dependencies:
+      - package: OberonTUI
+        product: OberonTUI
+      - package: OberonTUI
+        product: OberonRuntime
+    settings:
+      base:
+        # The Oberon side compiles into a static lib via the script
+        # phase below; point the linker at the per-config output.
+        OTHER_LDFLAGS: $(BUILT_PRODUCTS_DIR)/liboed_oberon.a
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Oed/Oed-Bridging-Header.h
+        PRODUCT_BUNDLE_IDENTIFIER: com.1av.oed
+        INFOPLIST_FILE: Resources/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"   # iPhone + iPad
+        SWIFT_VERSION: "5.9"
+        # Allow Swift to call our bridging-header'd C symbols.
+        CLANG_ENABLE_MODULES: YES
+    preBuildScripts:
+      - name: Compile Oberon sources
+        # Always runs (no input/output mapping) — keeps the scaffold
+        # simple. A real build script can declare its inputs/outputs
+        # to skip on rebuilds.
+        script: |
+          set -euo pipefail
+          "${SRCROOT}/Scripts/build-oberon.sh"
+        basedOnDependencyAnalysis: false
