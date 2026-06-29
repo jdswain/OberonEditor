@@ -1,13 +1,13 @@
 // OedApp.swift — SwiftUI app entry.
 //
-// Drives the Oberon side at launch: oc_set_args (no argv on iOS) and
-// then Oed__init, which transitively initialises every imported
-// module and runs Oed.Run — which in turn registers the TUI key
-// handler and returns immediately (iOS / wasm event-driven path).
-// Once init has returned, the SwiftUI hierarchy owns the lifecycle:
-// keystrokes are dispatched into the Oberon handler via
-// oc_dispatch_key from TerminalView's key bindings, and the
-// terminal redraws when TerminalState publishes a new frame.
+// At app launch we stash a (no-op on iOS) argv via oc_set_args so
+// the runtime sees a valid arg state from the very first module
+// body. The Oberon-side init (Oed__init, which transitively runs
+// every imported module's init and calls Oed.Run) is deferred to
+// TerminalView's onReady callback — fired once after the terminal
+// has measured its real cell dimensions. Otherwise the initial
+// paint happens at the 24×80 default and gets resized away as
+// SwiftUI lays out for real.
 
 import SwiftUI
 import OberonTUI
@@ -17,7 +17,10 @@ import OberonRuntime
 struct OedApp: App {
     init() {
         oc_set_args(0, nil)
-        Oed__init()
+        // Resolve relative paths under the app's Documents directory
+        // (visible in the Files app — see Info.plist) so Oed.Old /
+        // Oed.New write somewhere persistent and user-reachable.
+        Env.useDocumentsDirectory()
     }
 
     var body: some Scene {

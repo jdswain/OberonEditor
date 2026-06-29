@@ -12,7 +12,10 @@ MODULE Links;
      bare path      → same, treated as project-logical
      scheme://...   → external; do not navigate *)
 
-  IMPORT Strings, Buffer, Lines, Viewers, Project, Render;
+  IMPORT Env, Strings, Buffer, Lines, Viewers, Project, Render;
+
+  CONST
+    Newline = 0AX;
 
   TYPE
     MakeView* = PROCEDURE(VAR n: ARRAY OF CHAR): Viewers.Viewer;
@@ -177,18 +180,119 @@ MODULE Links;
     END
   END resolveAgainst;
 
+  PROCEDURE strEq(a, b: ARRAY OF CHAR): BOOLEAN;
+    VAR i: INTEGER; eq: BOOLEAN;
+  BEGIN
+    eq := TRUE; i := 0;
+    WHILE eq & (a[i] # 0X) DO
+      eq := a[i] = b[i]; INC(i)
+    END;
+    IF eq THEN eq := b[i] = 0X END;
+    RETURN eq
+  END strEq;
+
+  (* GitHub-style slug for heading text: lowercase ASCII, alnum kept,
+     `-` and `_` kept, whitespace collapsed to `-`, all other chars
+     dropped. The same transform must run on both the heading text
+     used to build a fragment and on the headings being searched. *)
+  PROCEDURE Slug*(title: ARRAY OF CHAR; VAR out: ARRAY OF CHAR);
+    VAR src, dst: INTEGER; ch: CHAR;
+  BEGIN
+    src := 0; dst := 0;
+    WHILE (src < LEN(title)) & (title[src] # 0X) & (dst < LEN(out) - 1) DO
+      ch := title[src];
+      IF (ch >= "A") & (ch <= "Z") THEN
+        out[dst] := CHR(ORD(ch) + 32); INC(dst)
+      ELSIF ((ch >= "a") & (ch <= "z")) OR ((ch >= "0") & (ch <= "9"))
+          OR (ch = "-") OR (ch = "_") THEN
+        out[dst] := ch; INC(dst)
+      ELSIF (ch = " ") OR (ch = 09X) THEN
+        out[dst] := "-"; INC(dst)
+      END;
+      INC(src)
+    END;
+    out[dst] := 0X
+  END Slug;
+
+  (* Split `url` at the first '#'. If there's no '#', frag is empty
+     and hasFrag is FALSE. Both outputs are NUL-terminated. *)
+  PROCEDURE splitFragment(url: ARRAY OF CHAR;
+                          VAR path, frag: ARRAY OF CHAR;
+                          VAR hasFrag: BOOLEAN);
+    VAR i, j: INTEGER; inFrag: BOOLEAN;
+  BEGIN
+    inFrag := FALSE; i := 0; j := 0;
+    WHILE (i < LEN(url)) & (url[i] # 0X) DO
+      IF ~inFrag & (url[i] = "#") THEN
+        path[j] := 0X; inFrag := TRUE; j := 0
+      ELSIF inFrag THEN
+        IF j < LEN(frag) - 1 THEN frag[j] := url[i]; INC(j) END
+      ELSE
+        IF j < LEN(path) - 1 THEN path[j] := url[i]; INC(j) END
+      END;
+      INC(i)
+    END;
+    IF inFrag THEN frag[j] := 0X
+    ELSE path[j] := 0X; frag[0] := 0X
+    END;
+    hasFrag := inFrag
+  END splitFragment;
+
+  (* Byte offset of the first heading line whose slugified title
+     matches `slug`, or -1 if none. A heading is a line whose first
+     non-whitespace run is one or more '#' followed by a space. *)
+  PROCEDURE FindHeading*(buf: Buffer.Buffer; lines: Lines.Lines;
+                         slug: ARRAY OF CHAR): INTEGER;
+    VAR i, n, p, e, j, found: INTEGER;
+        r: Buffer.Reader; ch: CHAR;
+        title, cand: ARRAY 256 OF CHAR;
+  BEGIN
+    found := -1;
+    n := Lines.Count(lines); i := 0;
+    WHILE (i < n) & (found = -1) DO
+      p := Lines.LineStart(lines, i);
+      e := Lines.LineEnd(lines, i);
+      IF (p < e) & (Render.CharAt(buf, p) = "#") THEN
+        Buffer.OpenReader(r, buf, p);
+        Buffer.Read(r, ch);
+        WHILE ~r.eot & (p < e) & (ch = "#") DO
+          INC(p); Buffer.Read(r, ch)
+        END;
+        IF ~r.eot & (p < e) & (ch = " ") THEN
+          WHILE ~r.eot & (p < e) & (ch = " ") DO
+            INC(p); Buffer.Read(r, ch)
+          END;
+          j := 0;
+          WHILE ~r.eot & (p < e) & (ch # Newline) & (j < LEN(title) - 1) DO
+            title[j] := ch; INC(j); INC(p); Buffer.Read(r, ch)
+          END;
+          title[j] := 0X;
+          Slug(title, cand);
+          IF strEq(cand, slug) THEN
+            found := Lines.LineStart(lines, i)
+          END
+        END
+      END;
+      INC(i)
+    END;
+    RETURN found
+  END FindHeading;
+
   PROCEDURE follow(url, srcPath: ARRAY OF CHAR;
                    makeView: MakeView; switch: Switch;
                    VAR status: ARRAY OF CHAR);
-    VAR path, phys: ARRAY 256 OF CHAR;
+    VAR raw, pathOnly, phys, frag: ARRAY 256 OF CHAR;
         target: Viewers.Viewer;
-        res: INTEGER;
+        res, headPos: INTEGER;
+        hasFrag: BOOLEAN;
   BEGIN
     IF hasScheme(url) THEN
-      Strings.Copy(status, "External URL — not followed")
+      Env.OpenURL(url);
+      Strings.Copy(status, "Opening external URL...")
     ELSE
-      stripFile(url, path);
-      resolveAgainst(srcPath, path, phys);
+      stripFile(url, raw);
+      splitFragment(raw, pathOnly, frag, hasFrag);
+      resolveAgainst(srcPath, pathOnly, phys);
       target := Viewers.FindByDocName(phys);
       IF target = NIL THEN
         target := makeView(phys);
@@ -196,8 +300,24 @@ MODULE Links;
         Lines.Invalidate(target.doc.lines);
         Viewers.Add(target)
       END;
+      headPos := -1;
+      IF hasFrag THEN
+        headPos := FindHeading(target.doc.buf, target.doc.lines, frag);
+        IF headPos >= 0 THEN
+          target.cur := headPos;
+          target.top := headPos
+        END
+      END;
       switch(target);
-      Strings.Copy(status, "Followed link")
+      IF hasFrag THEN
+        IF headPos >= 0 THEN
+          Strings.Copy(status, "Followed link to section")
+        ELSE
+          Strings.Copy(status, "Followed link — section not found")
+        END
+      ELSE
+        Strings.Copy(status, "Followed link")
+      END
     END
   END follow;
 

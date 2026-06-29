@@ -2,7 +2,7 @@ name: Oed
 options:
   bundleIdPrefix: com.1av
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "17.0"   # OberonTUI needs SwiftUI .onKeyPress (iOS 17+)
   createIntermediateGroups: true
 
 packages:

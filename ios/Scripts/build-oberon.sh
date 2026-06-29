@@ -53,8 +53,8 @@ clear_stale_objs() {
 }
 
 case "${PLATFORM_NAME}" in
-    iphoneos)         triple_arch="arm64";   triple_os="ios15.0" ;;
-    iphonesimulator)  triple_arch="${ARCHS%% *}"; triple_os="ios15.0-simulator" ;;
+    iphoneos)         triple_arch="arm64";   triple_os="ios17.0" ;;
+    iphonesimulator)  triple_arch="${ARCHS%% *}"; triple_os="ios17.0-simulator" ;;
     *) echo "error: unsupported PLATFORM_NAME=${PLATFORM_NAME}"; exit 1 ;;
 esac
 TRIPLE="${triple_arch}-apple-${triple_os}"
@@ -118,7 +118,7 @@ CFLAGS=(
     -c
 )
 
-for src in runtime.c TUI_rt.c Out_rt.c Env_rt.c; do
+for src in runtime.c TUI_rt.c Out_rt.c Env_rt.c Files_rt.c; do
     echo "build-oberon: compile runtime/${src}"
     "$CLANG" "${CFLAGS[@]}" -o "${OBJ_DIR}/${src%.c}.o" "${OC_RT}/${src}"
 done
